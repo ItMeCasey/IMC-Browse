@@ -12,6 +12,7 @@ mod cards;
 mod config;
 mod control;
 mod downloads;
+mod defaultbrowser;
 mod ext;
 mod passwords;
 mod internal;
@@ -788,6 +789,7 @@ struct Shell {
     internal: Arc<RwLock<internal::Internal>>,
     /// The AI panel is showing (it is created on first use and kept alive after that).
     ext_items: Vec<ext::Item>,
+    default_asked: bool,
     ai_open: bool,
     control_on: Arc<AtomicBool>,
     /// Text waiting for the panel's page to finish loading.
@@ -1613,6 +1615,7 @@ impl Shell {
             "cfg": self.cfg,
             "extensions": [],
             "maximized": self.window.is_maximized(),
+            "default_browser": {"is_default": defaultbrowser::is_default(), "check": self.cfg.default_check},
             "ai": {"open": self.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
             "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some(), "error": e.error})).collect::<Vec<_>>(),
             "control": {"enabled": self.cfg.control.enabled, "allow_js": self.cfg.control.allow_js},
@@ -1630,6 +1633,12 @@ impl Shell {
             "ready" => {
                 self.ui_ready = true;
                 self.push();
+                if self.cfg.default_check && !self.default_asked {
+                    self.default_asked = true;
+                    if !defaultbrowser::is_default() {
+                        self.eval_ui("window.ui.toast('IMC Browse is not your default browser.',{label:'Make default',cmd:'default_set',label2:\"Don't ask again\",cmd2:'default_ignore'})");
+                    }
+                }
             }
             "new" => {
                 let home = self.cfg.home.clone();
@@ -1940,6 +1949,17 @@ impl Shell {
             }
             "dl_folder" => downloads::open_folder(&downloads::dir()),
             "update_state" => self.push_update(),
+            "default_set" => defaultbrowser::open_settings(),
+            "default_ignore" => {
+                self.cfg.default_check = false;
+                self.cfg.save();
+                self.push();
+            }
+            "default_prefs" => {
+                self.cfg.default_check = m["check"].as_bool().unwrap_or(true);
+                self.cfg.save();
+                self.push();
+            }
             "update_prefs" => {
                 self.cfg.update.auto = m["auto"].as_bool().unwrap_or(false);
                 let nightly = m["nightly"].as_bool().unwrap_or(false);
@@ -2203,6 +2223,7 @@ fn main() {
     // Everything the browser spawns dies with it, and cannot break away.
     sandbox::contain_process_tree();
     updater::cleanup();
+    defaultbrowser::register();
     // Secure DNS lives in the engine's Local State file; set it before the engine starts.
     config::write_secure_dns(&config::root().join("cef-profile"), &cfg.doh);
     vpn::start_watchdog(cfg.vpn.clone());
@@ -2269,6 +2290,7 @@ fn main() {
         upd: updater::Ctl::new(),
         internal,
         ext_items: ext::items(),
+        default_asked: false,
         ai_open: false,
         control_on: Arc::new(AtomicBool::new(cfg.control.enabled)),
         ai_pending: None,

@@ -16,6 +16,8 @@ pub struct Config {
     pub vertical_tabs: bool,
     /// Draw and decode with the GPU. Off adds --disable-gpu (needs a restart).
     pub hardware_acceleration: bool,
+    /// Ask at startup when IMC Browse is not the default browser. "Don't ask again" turns this off.
+    pub default_check: bool,
     /// Items on either side of the address bar, by id (see the TB_DEFS table in chrome.html).
     pub toolbar: Toolbar,
     pub gestures: Gestures,
@@ -311,6 +313,7 @@ impl Default for Config {
             search_engine: "duckduckgo".into(),
             vertical_tabs: false,
             hardware_acceleration: true,
+            default_check: true,
             toolbar: Toolbar::default(),
             gestures: Gestures::default(),
             zoom: HashMap::new(),

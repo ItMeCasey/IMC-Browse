@@ -245,6 +245,9 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
     <section id="s-general" class="on">
       <h2>General</h2>
       <label class="row">Vertical tabs (sidebar)<input type="checkbox" id="p_vert"></label>
+      <label class="row">Default browser<span id="def_state" style="color:var(--dim)"></span><button class="sec inl" id="def_set">Make default</button></label>
+      <label class="row">Ask at startup when not the default<span class="switch"><input type="checkbox" id="def_check"><i></i></span></label>
+      <p class="note">Windows only lets you pick your default browser yourself: "Make default" opens that Windows page, where you choose IMC Browse.</p>
       <label class="row">Hardware acceleration<span class="switch"><input type="checkbox" id="p_hw"><i></i></span></label>
       <p class="note">Uses your graphics card to draw pages and decode video. Turn it off if you see flicker, black video or graphics-driver crashes. Changing it needs a restart. <button class="sec inl" id="hw_restart" style="display:none"></button></p>
       <label class="row">Hibernate unused tabs after (seconds)<input type="number" id="p_freeze" min="10"></label>
@@ -676,6 +679,7 @@ $('hw_restart').innerHTML=gl('reload',14)+'<span>Restart now</span>';
 $('p_hw').onchange=()=>{send({cmd:'hwaccel',enabled:$('p_hw').checked});$('hw_restart').style.display='inline-flex'};
 $('hw_restart').onclick=()=>send({cmd:'restart'});
 $('up_check').innerHTML=gl('reload',14)+'<span>Check now</span>';
+$('def_set').onclick=()=>send({cmd:'default_set'});$('def_check').onchange=()=>send({cmd:'default_prefs',check:$('def_check').checked});
 $('up_check').onclick=()=>send({cmd:'update_check'});
 const sendUpd=()=>send({cmd:'update_prefs',auto:$('up_auto').checked,nightly:$('up_nightly').checked});
 $('up_nightly').onchange=sendUpd;$('up_auto').onchange=sendUpd;
@@ -744,6 +748,7 @@ window.ui={
   const a=s.tabs.find(t=>t.id===s.active);
   document.body.classList.toggle('ghost',!!(a&&a.private));
   renderToolbar();
+  if(s.default_browser){$('def_state').textContent=s.default_browser.is_default?'IMC Browse is your default':'Not your default';$('def_set').style.display=s.default_browser.is_default?'none':'';$('def_check').checked=s.default_browser.check}
   if(s.ai){
     document.body.classList.toggle('ai',!!s.ai.open);document.documentElement.style.setProperty('--ai-w',s.ai.width+'px');
     $('aibtn').classList.toggle('on',!!s.ai.open);$('aibtn').innerHTML=gl(s.ai.enabled?aiGlyph(s.ai.site):'ai-off',18);$('aihead_ic').innerHTML=gl(aiGlyph(s.ai.site),18);
@@ -822,7 +827,8 @@ window.ui={
  revealed(i,pw){const e=$('pwl'+i);if(e)e.textContent=e.textContent.split('  •  ')[0]+'  •  '+pw},
  toast(m,act){
   const t=$('toast');t.textContent=m;t.style.display='block';t.style.pointerEvents=act?'auto':'none';
-  if(act){const b=document.createElement('button');b.className='act';b.style.marginLeft='12px';b.textContent=act.label;b.onclick=()=>{t.style.display='none';send({cmd:act.cmd})};t.append(b)}
+  if(act){const b=document.createElement('button');b.className='act';b.style.marginLeft='12px';b.textContent=act.label;b.onclick=()=>{t.style.display='none';send({cmd:act.cmd})};t.append(b);
+   if(act.label2){const c=document.createElement('button');c.className='act';c.style.marginLeft='8px';c.textContent=act.label2;c.onclick=()=>{t.style.display='none';send({cmd:act.cmd2})};t.append(c)}}
   clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',act?20000:6000)},
  updateState(u){
   U=u;
