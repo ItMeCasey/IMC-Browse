@@ -890,6 +890,21 @@ fn reparent(id: usize, parent: isize) {
     }
 }
 
+/// CEF's message pump runs inside tao's event handler and can dispatch a WM_PAINT for the window.
+/// tao answers that by calling the handler again, which panics ("event handler is re-entrant") and
+/// takes the whole browser down (seen when Windows shows a passkey prompt). We never draw in the
+/// window itself (every pixel belongs to a child browser), so paint messages are simply validated here.
+unsafe extern "system" fn paint_guard(hwnd: HWND, msg: u32, wp: windows::Win32::Foundation::WPARAM, lp: windows::Win32::Foundation::LPARAM, _id: usize, _data: usize) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::WM_PAINT;
+    if msg == WM_PAINT {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ValidateRect(Some(hwnd), None);
+        }
+        return windows::Win32::Foundation::LRESULT(0);
+    }
+    unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wp, lp) }
+}
+
 fn build_window(target: &tao::event_loop::EventLoopWindowTarget<Ev>, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) -> Window {
     let mut b = WindowBuilder::new().with_title("IMC Browse (CEF)").with_decorations(false);
     b = match size {
@@ -899,7 +914,11 @@ fn build_window(target: &tao::event_loop::EventLoopWindowTarget<Ev>, pos: Option
     if let Some((x, y)) = pos {
         b = b.with_position(tao::dpi::PhysicalPosition::new(x, y));
     }
-    b.build(target).expect("window")
+    let w = b.build(target).expect("window");
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(HWND(w.hwnd() as *mut _), Some(paint_guard), 1, 0);
+    }
+    w
 }
 
 /// Creates the chrome UI browser filling `window`.
