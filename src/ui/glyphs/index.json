@@ -89,6 +89,7 @@
   "claude": "Claude",
   "grok": "Grok",
   "chatgpt": "ChatGPT",
+  "copilot": "Copilot",
   "perplexity": "Perplexity",
   "chat": "Chat / conversation",
   "send": "Send prompt",
@@ -130,12 +131,5 @@
   "restore": "win-restore",
   "profile": "user",
   "bookmark-saved": "star-fill"
- },
- "brandColors": {
-  "gemini": "#4285f4",
-  "claude": "#d97757",
-  "grok": "#ffffff",
-  "chatgpt": "#10a37f",
-  "perplexity": "#20b8cd"
  }
 }

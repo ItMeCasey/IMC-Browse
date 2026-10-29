@@ -23,6 +23,7 @@ pub struct Config {
     pub zoom: HashMap<String, f64>,
     pub update: UpdateCfg,
     pub ai: Ai,
+    pub control: Control,
     pub doh: Doh,
     pub theme: Theme,
     pub vpn: Vpn,
@@ -43,6 +44,15 @@ impl Default for Toolbar {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect();
         Self { left: v(&["back", "forward", "reload"]), right: v(&["engine", "bookmark", "shield", "vpn", "ai", "downloads"]) }
     }
+}
+
+/// CLI control for AI tools (see control.rs). Both switches are off until the user turns them on.
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct Control {
+    pub enabled: bool,
+    /// Also allow the `eval` command (arbitrary JavaScript in a page).
+    pub allow_js: bool,
 }
 
 /// AI assistant: a side panel that opens the AI website you choose, in this browser's own session, so
@@ -306,6 +316,7 @@ impl Default for Config {
             zoom: HashMap::new(),
             update: UpdateCfg::default(),
             ai: Ai::default(),
+            control: Control::default(),
             doh: Doh::default(),
             theme: Theme::default(),
             vpn: Vpn::default(),

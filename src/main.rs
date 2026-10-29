@@ -4,10 +4,13 @@
 //!
 //! The Windows sandbox is off until the bootstrap launcher is set up.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod adblock;
 mod bookmarks;
 mod cards;
 mod config;
+mod control;
 mod downloads;
 mod passwords;
 mod internal;
@@ -70,6 +73,8 @@ enum Ev {
     Audio(usize, bool),
     /// A drawn gesture path (U/D/L/R) reported by a page.
     Gesture(String),
+    /// A command from an AI tool over the control pipe.
+    Control(control::Request),
     /// Text of the active page (or its selection), requested by "Send page".
     PageText { title: String, url: String, text: String, selected: bool },
     /// A page announced its icon(s); we fetch the first.
@@ -597,6 +602,45 @@ wrap_download_image_callback! {
     }
 }
 
+/// Results of DevTools-protocol commands, matched to the request that asked for them.
+static CDP_PENDING: std::sync::Mutex<Option<HashMap<i32, std::sync::mpsc::Sender<Value>>>> = std::sync::Mutex::new(None);
+static CDP_NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+thread_local! {
+    /// DevTools observers must stay registered for results to arrive: one per tab, kept here.
+    static CDP_REGS: RefCell<HashMap<usize, Registration>> = RefCell::new(HashMap::new());
+}
+
+wrap_dev_tools_message_observer! {
+    struct CdpObserver;
+    impl DevToolsMessageObserver {
+        fn on_dev_tools_method_result(&self, _b: Option<&mut Browser>, message_id: i32, success: i32, result: Option<&[u8]>) {
+            let v: Value = result.and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(Value::Null);
+            let tx = CDP_PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&message_id));
+            if let Some(tx) = tx {
+                let _ = tx.send(json!({"success": success != 0, "result": v}));
+            }
+        }
+    }
+}
+
+/// Hands a page's text or HTML to whoever asked (an AI tool).
+wrap_string_visitor! {
+    struct Grab {
+        reply: std::sync::mpsc::Sender<Value>,
+        key: String,
+    }
+    impl CefStringVisitor {
+        fn visit(&self, string: Option<&CefString>) {
+            let mut t = string.map(|s| s.to_string()).unwrap_or_default();
+            if t.len() > 1_000_000 {
+                t.truncate(1_000_000);
+            }
+            let _ = self.reply.send(json!({"ok": true, self.key.as_str(): t}));
+        }
+    }
+}
+
 wrap_client! {
     struct Cl {
         id: usize,
@@ -738,6 +782,7 @@ struct Shell {
     internal: Arc<RwLock<internal::Internal>>,
     /// The AI panel is showing (it is created on first use and kept alive after that).
     ai_open: bool,
+    control_on: Arc<AtomicBool>,
     /// Text waiting for the panel's page to finish loading.
     ai_pending: Option<String>,
     downloads: Vec<downloads::Item>,
@@ -1102,6 +1147,9 @@ impl Shell {
         d.proxy = if self.cfg.vpn.enabled { format!("{} {}:{}{}", self.cfg.vpn.kind, self.cfg.vpn.host, self.cfg.vpn.port, if self.cfg.vpn.kill_switch { " (kill switch on)" } else { "" }) } else { "Direct connection (no proxy)".into() };
         d.gestures = self.cfg.gestures.clone();
         d.doh = self.cfg.doh.describe();
+        d.ai_site = self.cfg.ai.url().unwrap_or_else(|| self.cfg.ai.site.clone());
+        d.control_on = self.cfg.control.enabled;
+        d.allow_js = self.cfg.control.allow_js;
     }
 
     /// Certificate and connection details for the open page (the lock popup).
@@ -1330,6 +1378,167 @@ impl Shell {
         self.eval_ui(js);
     }
 
+    /// Runs one DevTools command in a tab; `finish` turns the raw answer into the reply.
+    fn cdp(&self, tab: usize, method: &str, params: Value, reply: std::sync::mpsc::Sender<Value>, finish: fn(Value) -> Value) {
+        let Some(browser) = BROWSERS.with(|m| m.borrow().get(&tab).cloned()) else {
+            let _ = reply.send(json!({"error": "that tab is not available"}));
+            return;
+        };
+        let Some(host) = browser.host() else { return };
+        CDP_REGS.with(|r| {
+            r.borrow_mut().entry(tab).or_insert_with(|| {
+                let mut obs = CdpObserver::new();
+                host.add_dev_tools_message_observer(Some(&mut obs)).expect("devtools observer")
+            });
+        });
+        let id = CDP_NEXT.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        CDP_PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, tx);
+        let mut dict = cef::parse_json(Some(&cs(&params.to_string())), cef::JsonParserOptions::RFC).and_then(|v| v.dictionary());
+        host.execute_dev_tools_method(id, Some(&cs(method)), dict.as_mut());
+        std::thread::spawn(move || {
+            let out = match rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(raw) => finish(raw),
+                Err(_) => json!({"error": "the page did not answer in time"}),
+            };
+            let _ = reply.send(out);
+        });
+    }
+
+    /// A command from an AI tool. Ghost tabs are invisible here, and nothing touches passwords, cards or downloads.
+    fn on_control(&mut self, r: control::Request) {
+        let control::Request { body, reply } = r;
+        let cmd = body["cmd"].as_str().unwrap_or("").to_string();
+        let tab = body["tab"].as_u64().map(|v| v as usize).unwrap_or(self.active);
+        let short = |s: &str| s.chars().take(80).collect::<String>();
+        control::audit(match cmd.as_str() {
+            "open" | "navigate" => format!("{cmd} {}", short(body["url"].as_str().unwrap_or(""))),
+            "click" => format!("click {}", short(body["selector"].as_str().unwrap_or(""))),
+            "type" => format!("type into {} ({} characters)", short(body["selector"].as_str().unwrap_or("")), body["text"].as_str().unwrap_or("").chars().count()),
+            "eval" => format!("eval {}", short(body["expression"].as_str().unwrap_or(""))),
+            _ => cmd.clone(),
+        });
+        let fail = |m: &str| {
+            let _ = reply.send(json!({"error": m}));
+        };
+        let visible = self.tabs.iter().any(|t| t.id == tab && !t.private);
+        let needs_tab = ["navigate", "back", "forward", "reload", "text", "html", "screenshot", "click", "type", "scroll", "eval"];
+        if needs_tab.contains(&cmd.as_str()) && !visible {
+            return fail("no such tab (Ghost tabs cannot be controlled)");
+        }
+        let js_string = |v: &Value| Value::String(v.as_str().unwrap_or("").to_string()).to_string();
+        let runtime = |expr: String| json!({"expression": expr, "returnByValue": true, "awaitPromise": true});
+        fn value_of(raw: Value) -> Value {
+            let r = &raw["result"];
+            if raw["success"] != true || r["exceptionDetails"].is_object() {
+                return json!({"error": r["exceptionDetails"]["exception"]["description"].as_str().unwrap_or("the page could not run that")});
+            }
+            let v = r["result"]["value"].clone();
+            if v["error"].is_string() { json!({"error": v["error"]}) } else { json!({"ok": true, "value": v}) }
+        }
+        match cmd.as_str() {
+            "status" => {
+                let _ = reply.send(json!({"ok": true, "version": updater::VERSION, "build": updater::BUILD_ID, "tabs": self.tabs.iter().filter(|t| !t.private).count(), "js_allowed": self.cfg.control.allow_js}));
+            }
+            "tabs" => {
+                let list: Vec<Value> = self.tabs.iter().filter(|t| !t.private).map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "active": t.id == self.active, "loading": t.loading})).collect();
+                let _ = reply.send(json!({"ok": true, "tabs": list}));
+            }
+            "open" => {
+                let url = normalize(body["url"].as_str().unwrap_or(""), &self.cfg.search_engine);
+                if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url.starts_with("imc://")) {
+                    return fail("only http, https, file and imc addresses can be opened");
+                }
+                let n = self.new_tab(&url, false);
+                self.activate(n);
+                let _ = reply.send(json!({"ok": true, "id": n}));
+            }
+            "navigate" => {
+                let url = normalize(body["url"].as_str().unwrap_or(""), &self.cfg.search_engine);
+                if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url.starts_with("imc://")) {
+                    return fail("only http, https, file and imc addresses can be opened");
+                }
+                BROWSERS.with(|m| {
+                    if let Some(f) = m.borrow().get(&tab).and_then(|b| b.main_frame()) {
+                        f.load_url(Some(&cs(&url)));
+                    }
+                });
+                let _ = reply.send(json!({"ok": true}));
+            }
+            "switch" | "close" => {
+                let id = body["id"].as_u64().map(|v| v as usize).unwrap_or(self.active);
+                if !self.tabs.iter().any(|t| t.id == id && !t.private) {
+                    return fail("no such tab (Ghost tabs cannot be controlled)");
+                }
+                if cmd == "switch" {
+                    self.activate(id);
+                } else {
+                    self.close(id);
+                }
+                let _ = reply.send(json!({"ok": true}));
+            }
+            "back" | "forward" | "reload" => {
+                BROWSERS.with(|m| {
+                    if let Some(b) = m.borrow().get(&tab) {
+                        match cmd.as_str() {
+                            "back" => b.go_back(),
+                            "forward" => b.go_forward(),
+                            _ => b.reload(),
+                        }
+                    }
+                });
+                let _ = reply.send(json!({"ok": true}));
+            }
+            "text" | "html" => {
+                let frame = BROWSERS.with(|m| m.borrow().get(&tab).and_then(|b| b.main_frame()));
+                let Some(f) = frame else { return fail("that tab is not available") };
+                let mut g = Grab::new(reply, cmd.clone());
+                if cmd == "text" { f.text(Some(&mut g)) } else { f.source(Some(&mut g)) }
+            }
+            "screenshot" => {
+                if tab != self.active {
+                    return fail("switch to that tab first (screenshots need it on screen)");
+                }
+                self.cdp(tab, "Page.captureScreenshot", json!({"format": "png"}), reply, |raw| match raw["result"]["data"].as_str() {
+                    Some(d) if raw["success"] == true => json!({"ok": true, "png_base64": d}),
+                    _ => json!({"error": "could not take a screenshot"}),
+                });
+            }
+            "click" => {
+                let sel = js_string(&body["selector"]);
+                let expr = format!("(()=>{{const e=document.querySelector({sel});if(!e)return{{error:'no element matches that selector'}};e.scrollIntoView({{block:'center'}});e.click();return{{tag:e.tagName}}}})()");
+                self.cdp(tab, "Runtime.evaluate", runtime(expr), reply, value_of);
+            }
+            "type" => {
+                let (sel, text) = (js_string(&body["selector"]), js_string(&body["text"]));
+                let expr = format!(
+                    "(()=>{{const e=document.querySelector({sel});if(!e)return{{error:'no element matches that selector'}};e.focus();const t={text};\
+                     if(e.tagName==='TEXTAREA'||e.tagName==='INPUT'){{Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value').set.call(e,t);e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}))}}\
+                     else{{document.execCommand('selectAll',false);document.execCommand('insertText',false,t)}}return{{typed:t.length}}}})()"
+                );
+                self.cdp(tab, "Runtime.evaluate", runtime(expr), reply, value_of);
+            }
+            "scroll" => {
+                let to = body["to"].as_str().unwrap_or("down");
+                let expr = match to {
+                    "up" => "window.scrollBy({top:-innerHeight*0.85,behavior:'instant'});({ok:true})",
+                    "top" => "window.scrollTo({top:0,behavior:'instant'});({ok:true})",
+                    "bottom" => "window.scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'});({ok:true})",
+                    _ => "window.scrollBy({top:innerHeight*0.85,behavior:'instant'});({ok:true})",
+                };
+                self.cdp(tab, "Runtime.evaluate", runtime(expr.to_string()), reply, value_of);
+            }
+            "eval" => {
+                if !self.cfg.control.allow_js {
+                    return fail("running JavaScript is not allowed: turn on 'Allow running JavaScript' in Settings, AI");
+                }
+                let expr = body["expression"].as_str().unwrap_or("").to_string();
+                self.cdp(tab, "Runtime.evaluate", runtime(expr), reply, value_of);
+            }
+            _ => fail("unknown command"),
+        }
+    }
+
     fn eval_page(&self, js: &str) {
         self.with_active(|b| {
             if let Some(f) = b.main_frame() {
@@ -1398,6 +1607,7 @@ impl Shell {
             "extensions": [],
             "maximized": self.window.is_maximized(),
             "ai": {"open": self.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
+            "control": {"enabled": self.cfg.control.enabled, "allow_js": self.cfg.control.allow_js},
             "ai_sites": config::AI_SITES.iter().map(|(id, n, _)| json!({"id": id, "name": n})).collect::<Vec<_>>(),
             "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
         });
@@ -1586,6 +1796,23 @@ impl Shell {
                     }
                 });
             }
+            "control_settings" => {
+                let (on, js) = (m["enabled"].as_bool().unwrap_or(false), m["allow_js"].as_bool().unwrap_or(false));
+                if on != self.cfg.control.enabled {
+                    control::audit(if on { "AI control turned on".into() } else { "AI control turned off".into() });
+                }
+                if js != self.cfg.control.allow_js {
+                    control::audit(if js { "running JavaScript allowed".into() } else { "running JavaScript not allowed".into() });
+                }
+                self.cfg.control = config::Control { enabled: on, allow_js: on && js };
+                self.control_on.store(on, Ordering::Relaxed);
+                self.cfg.save();
+                self.sync_internal();
+                self.push();
+                if on {
+                    self.toast("AI control is on. Programs running as you can now drive this browser. Ghost tabs stay private.");
+                }
+            }
             "ai_toggle" => {
                 if self.cfg.ai.enabled {
                     self.ai_open = !self.ai_open;
@@ -1770,6 +1997,7 @@ impl Shell {
                     c.update = self.cfg.update.clone();
                     c.doh = self.cfg.doh.clone();
                     c.ai = self.cfg.ai.clone();
+                    c.control = self.cfg.control.clone();
                     c.theme = self.cfg.theme.clone();
                     c.vertical_tabs = self.cfg.vertical_tabs;
                     c.save();
@@ -1905,6 +2133,10 @@ fn cli(args: &[String]) -> bool {
     true
 }
 
+fn argv_first_is_ctl() -> bool {
+    std::env::args().nth(1).as_deref() == Some("ctl")
+}
+
 fn main() {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
@@ -1917,6 +2149,14 @@ fn main() {
         std::process::exit(code);
     }
 
+    if argv_first_is_ctl() {
+        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(control::client(&rest));
+    }
     // From here on this is the browser process (not a renderer/GPU/utility child).
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if cli(&argv) {
@@ -1969,7 +2209,7 @@ fn main() {
         )
     };
     let shield = Arc::new(Shield { engine, css_js, enabled: AtomicBool::new(cfg.adblock), blocked: AtomicUsize::new(0), kill_switch: cfg.vpn.enabled && cfg.vpn.kill_switch, gest: std::sync::RwLock::new(cfg.gestures.page_config()) });
-    let internal = Arc::new(RwLock::new(internal::Internal { engine: String::new(), flags: String::new(), hw: true, proxy: String::new(), doh: String::new(), gestures: cfg.gestures.clone() }));
+    let internal = Arc::new(RwLock::new(internal::Internal { engine: String::new(), flags: String::new(), hw: true, proxy: String::new(), doh: String::new(), gestures: cfg.gestures.clone(), ai_site: String::new(), control_on: false, allow_js: false }));
     {
         let mut factory = ImcSchemes::new(internal.clone(), shield.clone());
         register_scheme_handler_factory(Some(&cs("imc")), None, Some(&mut factory));
@@ -1991,6 +2231,7 @@ fn main() {
         upd: updater::Ctl::new(),
         internal,
         ai_open: false,
+        control_on: Arc::new(AtomicBool::new(cfg.control.enabled)),
         ai_pending: None,
         dl_ids: Arc::new(AtomicU64::new(downloads.iter().map(|d| d.id).max().unwrap_or(0) + 1)),
         downloads,
@@ -2013,6 +2254,12 @@ fn main() {
         }
     }
     state.sync_internal();
+    {
+        let tx_ctl = tx.clone();
+        control::serve(state.control_on.clone(), move |r| {
+            let _ = tx_ctl.send_event(Ev::Control(r));
+        });
+    }
     state.activate(first);
     let p_tick = tx.clone();
     std::thread::spawn(move || loop {
@@ -2147,6 +2394,7 @@ fn main() {
                 Ev::Zoom(d) => state.zoom_cmd(&d),
                 Ev::Update(m) => state.on_update(m),
                 Ev::Download(e) => state.on_download(e),
+                Ev::Control(r) => state.on_control(r),
                 Ev::PageText { title, url, text, selected } => {
                     let head = if selected { format!("I selected this text on the page \"{title}\" ({url}):") } else { format!("Here is the page \"{title}\" ({url}):") };
                     let msg = format!("{head}\n\n{text}\n\n");

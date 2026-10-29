@@ -138,9 +138,10 @@ GROUPS = [
  ("AI assistants", [
   ("gemini", p("M12 2c.6 6 4 9.4 10 10-6 .6-9.4 4-10 10-.6-6-4-9.4-10-10 6-.6 9.4-4 10-10z", F)),
   ("claude", "<g stroke-width=\"2.5\">" + p(rays(12, [10, 7, 9.5, 6.5, 10, 7.5, 9, 6.5, 10, 7, 9.5, 7], 0)) + "</g>"),
-  ("grok", "<g stroke-width=\"3.4\">" + p("M17.4 6.4A7.6 7.6 0 1 0 19.6 13") + p("M8.5 15.5l11-11") + "</g>"),
-  ("chatgpt", "<g stroke-width=\"1.9\">" + "".join(f'<rect x="9.4" y="2.7" width="5.2" height="9.9" rx="2.6" transform="rotate({k*60} 12 12)"/>' for k in range(6)) + "</g>"),
-  ("perplexity", "<g stroke-width=\"2.2\">" + p("M5.5 2.8v7L12 15.5l6.5-5.7v-7L12 9zM12 9v12.7M5.5 13.5v7.3l6.5-5.5M18.5 13.5v7.3L12 15.3") + "</g>"),
+  ("grok", "<g stroke-width=\"2.5\">" + p("M4.09 15.10A8.5 8.5 0 0 1 15.10 4.09") + p("M19.91 8.90A8.5 8.5 0 0 1 8.90 19.91") + p("M3.5 20.5 20.5 3.5") + "</g>"),
+  ("chatgpt", "<g stroke-width=\"1.6\">" + "".join(f'<rect x="7" y="3.4" width="10" height="3.8" rx="1.9" transform="rotate({k*60} 12 12) rotate(-22 12 5.3)"/>' for k in range(6)) + "</g>"),
+  ("copilot", "<g stroke-width=\"3\">" + p("M18.5 8C14.5 3.5 7.5 4.5 6 11") + p("M5.5 16C9.5 20.5 16.5 19.5 18 13") + p("M12.5 9.5 11.5 14.5") + "</g>"),
+  ("perplexity", "<g stroke-width=\"1.7\">" + p("M12 2v20M3.35 8.25H20.65M6 2L6 8.25M6 2L12 8.25M3.35 8.25L3.35 16.6L6 16.6M6 14L12 8.25M6 14L6 20.75L12 15.75M18 2L18 8.25M18 2L12 8.25M20.65 8.25L20.65 16.6L18 16.6M18 14L12 8.25M18 14L18 20.75L12 15.75") + "</g>"),
   ("chat",       p("M5.5 4.5h13a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H11l-4.5 4v-4h-1a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z")),
   ("send",       p("M20 4 10.5 13.5M20 4l-6 16-3.5-6.5L4 10z")),
   ("bot",        '<rect x="4.5" y="8" width="15" height="11" rx="3.5"/>' + p("M12 8V5") + dot(12, 4.2, 1.5) + dot(9, 13.5, 1.4) + dot(15, 13.5, 1.4)),
@@ -154,7 +155,6 @@ GROUPS = [
  ]),
 ]
 
-BRAND = {"gemini": "#4285f4", "claude": "#d97757", "grok": "#ffffff", "chatgpt": "#10a37f", "perplexity": "#20b8cd"}
 ALL = [(n, b) for _, g in GROUPS for n, b in g]
 assert len({n for n, _ in ALL}) == len(ALL), "duplicate glyph name"
 
@@ -177,7 +177,7 @@ cards = ""
 for title, items in GROUPS:
     cards += f'<h2>{title}</h2><div class="grid">'
     for n, _ in items:
-        cards += (f'<div class="card{" spin" if n == "loading" else ""}"><svg class="g big" style="color:{BRAND.get(n,'')}"><use href="#g-{n}"/></svg>'
+        cards += (f'<div class="card{" spin" if n == "loading" else ""}"><svg class="g big"><use href="#g-{n}"/></svg>'
                   f'<span>{n}</span></div>')
     cards += "</div>"
 
@@ -296,7 +296,7 @@ USE = {
  "page-error": "Page failed to load",
  "gemini": "Gemini", "claude": "Claude", "grok": "Grok",
  "chatgpt": "ChatGPT", "perplexity": "Perplexity", "chat": "Chat / conversation",
- "send": "Send prompt", "bot": "Generic AI agent", "cpu": "Local / on-device model",
+ "copilot": "Copilot", "send": "Send prompt", "bot": "Generic AI agent", "cpu": "Local / on-device model",
  "info": "Information", "warning": "Warning", "ok": "Success", "error": "Error",
 }
 ALIASES = {"tab-close": "close", "settings": "sliders", "vertical-tabs": "sidebar", "downloads": "download",
@@ -311,7 +311,7 @@ for old in gd.glob("*.svg"): old.unlink()
 head = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
         f'stroke-width="{GW}" stroke-linecap="round" stroke-linejoin="round">')
 body = dict(ALL)
-index = {"viewBox": "24 24", "strokeWidth": GW, "color": "currentColor", "glyphs": {}, "aliases": ALIASES, "brandColors": BRAND}
+index = {"viewBox": "24 24", "strokeWidth": GW, "color": "currentColor", "glyphs": {}, "aliases": ALIASES}
 for n, _ in ALL:
     assert n in USE, n
     (gd / f"{n}.svg").write_text(head + body[n] + "</svg>\n", encoding="utf-8")

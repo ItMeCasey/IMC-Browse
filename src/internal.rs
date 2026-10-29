@@ -23,6 +23,9 @@ pub struct Internal {
     pub proxy: String,
     pub doh: String,
     pub gestures: config::Gestures,
+    pub ai_site: String,
+    pub control_on: bool,
+    pub allow_js: bool,
 }
 
 const PAGES: &[(&str, &str, &str)] = &[
@@ -32,6 +35,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("bookmarks", "Bookmarks", "Everything you have saved, searchable"),
     ("blocker", "Blocker", "Ad and tracker filtering, rules and lists"),
     ("shortcuts", "Shortcuts", "Keyboard shortcuts and mouse gestures"),
+    ("ai", "AI and control", "The AI panel and command-line control"),
 ];
 
 const ICON_HOME: &str = include_str!("ui/glyphs/home.svg");
@@ -41,11 +45,13 @@ const ICON_EXT: &str = include_str!("ui/glyphs/extension.svg");
 const ICON_BM: &str = include_str!("ui/glyphs/bookmarks.svg");
 const ICON_SHIELD: &str = include_str!("ui/glyphs/shield-ok.svg");
 const ICON_KEYS: &str = include_str!("ui/glyphs/grip.svg");
+const ICON_AI: &str = include_str!("ui/glyphs/ai.svg");
 const ICON_SET: &str = include_str!("ui/glyphs/sliders.svg");
 
 fn icon(name: &str) -> &'static str {
     match name {
         "" => ICON_HOME,
+        "ai" => ICON_AI,
         "version" => ICON_INFO,
         "gpu" => ICON_GPU,
         "extensions" => ICON_EXT,
@@ -246,6 +252,30 @@ pub fn page(name: &str, d: &Internal, stats: &Stats) -> Option<String> {
                 note(ICON_INFO, "See <a href=\"imc://blocker\">Blocker</a> for what is filtered, or <a href=\"imc://settings/toolbar\">Settings, Toolbar</a> to arrange the buttons you do have.")
             );
             Some(shell("Extensions", "extensions", "Not available yet", &body))
+        }
+        "ai" => {
+            let state = |on: bool| if on { "<span class=\"pill ok\">On</span>" } else { "<span class=\"pill\">Off</span>" };
+            let st = kv(&[
+                ("AI side panel", format!("{} {}", state(true), esc(&d.ai_site))),
+                ("Command-line control", state(d.control_on).to_string()),
+                ("Running JavaScript", if d.allow_js { "<span class=\"pill bad\">Allowed</span>".to_string() } else { "<span class=\"pill\">Not allowed</span>".to_string() }),
+            ]);
+            let usage = "<pre>imc-browse ctl status\nimc-browse ctl tabs\nimc-browse ctl open https://example.com\nimc-browse ctl text            # the page's visible text\nimc-browse ctl click \"a.more\"\nimc-browse ctl type \"#search\" hello world\nimc-browse ctl screenshot page.png\nimc-browse ctl help</pre>";
+            let mut log = String::from("<table><tr><th>When</th><th>Request</th></tr>");
+            let now = crate::updater::now_unix();
+            let entries = crate::control::audit_list();
+            for (t, m) in entries.iter().rev().take(60) {
+                log.push_str(&format!("<tr><td class=\"k\">{} s ago</td><td><code>{}</code></td></tr>", now.saturating_sub(*t), esc(m)));
+            }
+            if entries.is_empty() {
+                log.push_str("<tr><td colspan=\"2\" style=\"color:var(--dim)\">Nothing yet.</td></tr>");
+            }
+            log.push_str("</table>");
+            let body = format!(
+                "<h2>Status</h2>{st}{}<h2>Commands</h2>{usage}<h2>What AI tools asked for (newest first)</h2>{log}",
+                note(ICON_SHIELD, "Control is off until you turn it on in <a href=\"imc://settings/ai\">Settings, AI</a>. It only works for programs running as your Windows user. Ghost tabs are never visible to it, there are no commands for passwords, cards or downloads, and every request is listed here.")
+            );
+            Some(shell("AI and control", "ai", "The assistant panel and command-line control", &body))
         }
         "bookmarks" => {
             let body = if bms.is_empty() {
