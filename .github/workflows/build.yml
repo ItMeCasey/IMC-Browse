@@ -50,7 +50,7 @@ jobs:
 
       - name: Cache Chromium runtime
         id: cefcache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.local/share/cef
           key: cef-${{ steps.v.outputs.cef }}
