@@ -2,3 +2,5 @@
 /dist
 /docs/zz-*
 *.log
+/dist-dbg
+/target-dbg

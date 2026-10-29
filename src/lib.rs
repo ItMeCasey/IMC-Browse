@@ -872,7 +872,11 @@ fn normalize(t: &str, engine: &str) -> String {
     if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("file://") || lower.starts_with("chrome-extension://") || lower.starts_with("imc://") {
         return t.into();
     }
-    if !t.contains(' ') && !t.contains("://") && (t.contains('.') || lower.starts_with("localhost")) && !t.starts_with('.') {
+    // host:port with no dot (an intranet or dev server), or a bracketed IPv6 address
+    let host_port = t.split(['/', '?', '#']).next().and_then(|h| h.rsplit_once(':')).is_some_and(|(host, port)| {
+        !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '[' || c == ']' || c == ':') && !port.is_empty() && port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit())
+    });
+    if !t.contains(' ') && !t.contains("://") && (host_port || t.contains('.') || lower.starts_with("localhost")) && !t.starts_with('.') {
         return format!("https://{t}");
     }
     let q: String = t
@@ -3021,4 +3025,27 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
         do_message_loop_work();
         *flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(10));
     });
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize;
+
+    #[test]
+    fn addresses_are_opened_and_words_are_searched() {
+        for (typed, want) in [
+            ("example.com", "https://example.com"),
+            ("www.example.com/a?b=c", "https://www.example.com/a?b=c"),
+            ("example.com:8080/x", "https://example.com:8080/x"),
+            ("192.168.1.1", "https://192.168.1.1"),
+            ("localhost:3000", "https://localhost:3000"),
+            ("http://x.test/a b", "http://x.test/a b"),
+            ("myserver:3000", "https://myserver:3000"),
+            ("github.com/ItMeCasey/IMC-Browse", "https://github.com/ItMeCasey/IMC-Browse"),
+            ("  example.com  ", "https://example.com"),
+        ] {
+            assert_eq!(normalize(typed, "duckduckgo"), want, "typed {typed:?}");
+        }
+        assert!(normalize("how to bake bread", "duckduckgo").starts_with("https://duckduckgo.com/?q="));
+    }
 }
