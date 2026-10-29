@@ -32,6 +32,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("version", "Version", "Browser, engine and where your data lives"),
     ("gpu", "Graphics", "Hardware acceleration and GPU flags"),
     ("extensions", "Extensions", "What is installed and how to open it"),
+    ("history", "History", "Pages you visited, searchable"),
     ("bookmarks", "Bookmarks", "Everything you have saved, searchable"),
     ("blocker", "Blocker", "Ad and tracker filtering, rules and lists"),
     ("shortcuts", "Shortcuts", "Keyboard shortcuts and mouse gestures"),
@@ -42,6 +43,7 @@ const ICON_HOME: &str = include_str!("ui/glyphs/home.svg");
 const ICON_INFO: &str = include_str!("ui/glyphs/info.svg");
 const ICON_GPU: &str = include_str!("ui/glyphs/code.svg");
 const ICON_EXT: &str = include_str!("ui/glyphs/extension.svg");
+const ICON_HIST: &str = include_str!("ui/glyphs/history.svg");
 const ICON_BM: &str = include_str!("ui/glyphs/bookmarks.svg");
 const ICON_SHIELD: &str = include_str!("ui/glyphs/shield-ok.svg");
 const ICON_KEYS: &str = include_str!("ui/glyphs/grip.svg");
@@ -56,6 +58,7 @@ fn icon(name: &str) -> &'static str {
         "gpu" => ICON_GPU,
         "extensions" => ICON_EXT,
         "bookmarks" => ICON_BM,
+        "history" => ICON_HIST,
         "blocker" => ICON_SHIELD,
         "shortcuts" => ICON_KEYS,
         _ => ICON_SET,
@@ -194,6 +197,7 @@ pub fn page(name: &str, d: &Internal, stats: &Stats) -> Option<String> {
                 ("version", format!("IMC Browse {}", env!("CARGO_PKG_VERSION"))),
                 ("gpu", if d.hw { "Hardware acceleration on".into() } else { "Hardware acceleration off".into() }),
                 ("extensions", format!("{} installed", ext::items().len())),
+                ("history", format!("{} pages", crate::history::count())),
                 ("bookmarks", format!("{} saved", bms.len())),
                 ("blocker", format!("{} blocked this session", stats.blocked)),
                 ("shortcuts", format!("{} gestures set", d.gestures.binds.len())),
@@ -332,6 +336,34 @@ pub fn page(name: &str, d: &Internal, stats: &Stats) -> Option<String> {
                 rows
             };
             Some(shell("Bookmarks", "bookmarks", &format!("{} saved", bms.len()), &body))
+        }
+        "history" => {
+            let all = crate::history::all();
+            let body = if all.is_empty() {
+                "<div class=\"empty\"><b>No history yet</b><p>Pages you visit show up here. Ghost tabs are never recorded, and you can turn history off in <a href=\"imc://settings/privacy\">Settings, Privacy</a>.</p></div>".to_string()
+            } else {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let mut rows = String::from("<div style=\"display:flex;gap:10px;align-items:center\"><input class=\"search\" id=\"q\" placeholder=\"Search history\" autofocus style=\"flex:1\"><button class=\"act\" id=\"clr\">Clear all history</button></div><table id=\"t\"><tr><th>Visited</th><th>Page</th><th>Visits</th><th></th></tr>");
+                for e in all.iter().take(1500) {
+                    let t = if e.title.is_empty() { &e.url } else { &e.title };
+                    let ago = now.saturating_sub(e.ts);
+                    let when = match ago {
+                        0..=59 => "just now".to_string(),
+                        60..=3599 => format!("{} min ago", ago / 60),
+                        3600..=86399 => format!("{} h ago", ago / 3600),
+                        _ => format!("{} days ago", ago / 86400),
+                    };
+                    rows.push_str(&format!(
+                        "<tr data-u=\"{u}\"><td style=\"white-space:nowrap;color:var(--dim)\">{when}</td><td><a href=\"{u}\"><b>{}</b></a><br><span class=\"mono\" style=\"color:var(--dim);font-size:12px\">{u}</span></td><td>{}</td><td><a href=\"#\" class=\"del\">Remove</a></td></tr>",
+                        esc(t),
+                        e.visits,
+                        u = esc(&e.url)
+                    ));
+                }
+                rows.push_str("</table><script>const q=document.getElementById('q');q.oninput=()=>{const v=q.value.toLowerCase();for(const r of document.querySelectorAll('#t tr:not(:first-child)'))r.style.display=r.textContent.toLowerCase().includes(v)?'':'none'};for(const a of document.querySelectorAll('.del'))a.onclick=e=>{e.preventDefault();const r=a.closest('tr');console.debug('IMCHIST:del:'+r.dataset.u);r.remove()};document.getElementById('clr').onclick=()=>{if(confirm('Delete all browsing history?')){console.debug('IMCHIST:clear');setTimeout(()=>location.reload(),300)}}</script>");
+                rows
+            };
+            Some(shell("History", "history", &format!("{} pages", all.len()), &body))
         }
         "blocker" => {
                         let stats = format!(

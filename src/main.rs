@@ -14,6 +14,7 @@ mod control;
 mod downloads;
 mod defaultbrowser;
 mod ext;
+mod history;
 mod passwords;
 mod internal;
 mod sandbox;
@@ -88,6 +89,8 @@ enum Ev {
     Update(updater::UpdMsg),
     /// Zoom request from a page: "in", "out" or "reset".
     Zoom(String),
+    /// A command from the history page: "del:<url>" or "clear".
+    Hist(String),
     Tick,
     /// A browser finished closing (safe to release anything it was using).
     Closed,
@@ -179,9 +182,16 @@ wrap_display_handler! {
             }
         }
         // The chrome UI talks to Rust through console lines; only the UI's own client reads them.
-        fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, _s: Option<&CefString>, _line: i32) -> i32 {
+        fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, src: Option<&CefString>, _line: i32) -> i32 {
             if self.id != UI_ID {
                 if let Some(m) = msg.map(|m| m.to_string()) {
+                    if let Some(c) = m.strip_prefix("IMCHIST:") {
+                        // Only our own history page may change the history, never a website.
+                        if src.map(|s| s.to_string()).is_some_and(|s| s.starts_with("imc://history")) {
+                            let _ = self.tx.send_event(Ev::Hist(c.to_string()));
+                        }
+                        return 1;
+                    }
                     if let Some(t) = m.strip_prefix("SELFTEST_AI:") {
                         eprintln!("SELFTEST ai chat box now holds: {t}");
                         return 1;
@@ -1624,6 +1634,7 @@ impl Shell {
             "extensions": [],
             "maximized": self.window.is_maximized(),
             "restore_tabs": self.cfg.restore_tabs,
+            "save_history": self.cfg.save_history,
             "default_browser": {"is_default": defaultbrowser::is_default(), "check": self.cfg.default_check},
             "ai": {"open": self.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
             "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some(), "error": e.error})).collect::<Vec<_>>(),
@@ -1958,6 +1969,36 @@ impl Shell {
             }
             "dl_folder" => downloads::open_folder(&downloads::dir()),
             "update_state" => self.push_update(),
+            "history_prefs" => {
+                self.cfg.save_history = m["on"].as_bool().unwrap_or(true);
+                self.cfg.save();
+                self.push();
+            }
+            "history_clear" => {
+                let secs = match m["range"].as_str().unwrap_or("all") {
+                    "hour" => 3600,
+                    "day" => 86_400,
+                    "week" => 604_800,
+                    _ => 0,
+                };
+                history::clear_since(if secs == 0 { 0 } else { updater::now_unix().saturating_sub(secs) });
+                self.toast("History cleared.");
+            }
+            "suggest" => {
+                let q = m["q"].as_str().unwrap_or("");
+                let mut out: Vec<Value> = history::suggest(q, 6).iter().map(|e| json!({"url": e.url, "title": e.title})).collect();
+                let ql = q.to_lowercase();
+                for b in bookmarks::load().iter().filter(|b| !ql.is_empty() && (b.url.to_lowercase().contains(&ql) || b.title.to_lowercase().contains(&ql))).take(3) {
+                    if !out.iter().any(|o| o["url"] == b.url.as_str()) {
+                        out.push(json!({"url": b.url, "title": b.title}));
+                    }
+                }
+                self.eval_ui(&format!("window.ui.suggest({})", Value::Array(out)));
+            }
+            "history_open" => {
+                let n = self.new_tab("imc://history", false);
+                self.activate(n);
+            }
             "restore_prefs" => {
                 self.cfg.restore_tabs = m["on"].as_bool().unwrap_or(true);
                 self.cfg.save();
@@ -2412,6 +2453,7 @@ fn main() {
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 state.save_session();
+                history::flush();
                 finish();
                 *flow = ControlFlow::Exit;
                 return;
@@ -2440,8 +2482,18 @@ fn main() {
                     state.apply_zoom(id);
                     state.push();
                 }
+                Ev::Hist(c) => {
+                    if let Some(u) = c.strip_prefix("del:") {
+                        history::remove(u);
+                    } else if c == "clear" {
+                        history::clear_since(0);
+                    }
+                }
                 Ev::Title(id, title) => {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id && !t.frozen) {
+                        if !t.private && state.cfg.save_history && !t.loading {
+                            history::retitle(&t.url, &title);
+                        }
                         t.title = title;
                     }
                     state.push();
@@ -2456,6 +2508,9 @@ fn main() {
                 Ev::Load(id, loading) => {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id) {
                         t.loading = loading;
+                        if !loading && !t.private && !t.frozen && state.cfg.save_history {
+                            history::visit(&t.url, &t.title);
+                        }
                     }
                     state.push();
                 }
@@ -2470,6 +2525,7 @@ fn main() {
                     if state.last_session.elapsed() > Duration::from_secs(10) {
                         state.last_session = Instant::now();
                         state.save_session();
+                        history::flush();
                     }
                     if (state.cfg.update.auto || state.cfg.update.nightly) && state.upd.due(state.cfg.update.last_check) {
                         state.check_updates(false);

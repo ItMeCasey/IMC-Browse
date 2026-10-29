@@ -20,6 +20,8 @@ pub struct Config {
     pub default_check: bool,
     /// Reopen the tabs that were open when the browser last closed (Ghost tabs are never saved).
     pub restore_tabs: bool,
+    /// Remember the pages you visit (Ghost tabs never are).
+    pub save_history: bool,
     /// Items on either side of the address bar, by id (see the TB_DEFS table in chrome.html).
     pub toolbar: Toolbar,
     pub gestures: Gestures,
@@ -317,6 +319,7 @@ impl Default for Config {
             hardware_acceleration: true,
             default_check: true,
             restore_tabs: true,
+            save_history: true,
             toolbar: Toolbar::default(),
             gestures: Gestures::default(),
             zoom: HashMap::new(),

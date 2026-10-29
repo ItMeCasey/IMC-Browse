@@ -199,7 +199,7 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
   <span id="ghostpill" title="Ghost tab: nothing is saved when it closes"></span>
   <div id="urlbox">
     <button id="lock" title="Site information"></button><span id="logo"></span>
-    <input id="url" spellcheck="false" placeholder="Search or enter address">
+    <input id="url" spellcheck="false" list="sug" autocomplete="off" placeholder="Search or enter address"><datalist id="sug"></datalist>
     <button id="zoomind" title="Zoom level (click to reset to 100%)"></button>
     <span id="offline" title="You are offline"></span>
   </div>
@@ -361,6 +361,10 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
       <h2>Privacy &amp; proxy</h2>
       <label class="row">Block ads &amp; trackers<input type="checkbox" id="s_ads"></label>
       <label class="row">HTTPS-first<input type="checkbox" id="s_https"></label>
+      <h3>History</h3>
+      <label class="row">Remember the pages I visit<span class="switch"><input type="checkbox" id="h_on"><i></i></span></label>
+      <div class="tools"><button class="act inl" id="h_open">View history (Ctrl+H)</button><select id="h_range"><option value="hour">Last hour</option><option value="day">Last 24 hours</option><option value="week">Last 7 days</option><option value="all">All time</option></select><button class="sec inl" id="h_clear">Clear history</button></div>
+      <p class="note">Ghost tabs are never recorded. History stays on this computer.</p>
       <h3>Secure DNS</h3>
       <label class="row">DNS over HTTPS<span class="switch"><input type="checkbox" id="doh_on"><i></i></span></label>
       <div id="doh_opts">
@@ -681,6 +685,7 @@ $('hw_restart').innerHTML=gl('reload',14)+'<span>Restart now</span>';
 $('p_hw').onchange=()=>{send({cmd:'hwaccel',enabled:$('p_hw').checked});$('hw_restart').style.display='inline-flex'};
 $('hw_restart').onclick=()=>send({cmd:'restart'});
 $('up_check').innerHTML=gl('reload',14)+'<span>Check now</span>';
+$('h_on').onchange=()=>send({cmd:'history_prefs',on:$('h_on').checked});$('h_open').onclick=()=>send({cmd:'history_open'});$('h_clear').onclick=()=>send({cmd:'history_clear',range:$('h_range').value});
 $('p_restore').onchange=()=>send({cmd:'restore_prefs',on:$('p_restore').checked});
 $('def_set').onclick=()=>send({cmd:'default_set'});$('def_check').onchange=()=>send({cmd:'default_prefs',check:$('def_check').checked});
 $('up_check').onclick=()=>send({cmd:'update_check'});
@@ -751,6 +756,7 @@ window.ui={
   const a=s.tabs.find(t=>t.id===s.active);
   document.body.classList.toggle('ghost',!!(a&&a.private));
   renderToolbar();
+  $('h_on').checked=s.save_history!==false;
   $('p_restore').checked=s.restore_tabs!==false;
   if(s.default_browser){$('def_state').textContent=s.default_browser.is_default?'IMC Browse is your default':'Not your default';$('def_set').style.display=s.default_browser.is_default?'none':'';$('def_check').checked=s.default_browser.check}
   if(s.ai){
@@ -829,6 +835,7 @@ window.ui={
   if(!l.length)el.textContent='No saved cards.';
  },
  revealed(i,pw){const e=$('pwl'+i);if(e)e.textContent=e.textContent.split('  •  ')[0]+'  •  '+pw},
+ suggest(l){const d=$('sug');d.textContent='';for(const x of l){const o=document.createElement('option');o.value=x.url;o.label=x.title||x.url;d.append(o)}},
  toast(m,act){
   const t=$('toast');t.textContent=m;t.style.display='block';t.style.pointerEvents=act?'auto':'none';
   if(act){const b=document.createElement('button');b.className='act';b.style.marginLeft='12px';b.textContent=act.label;b.onclick=()=>{t.style.display='none';send({cmd:act.cmd})};t.append(b);
@@ -914,6 +921,7 @@ function readFile(input,cmd){input.onchange=()=>{const f=input.files[0];if(!f)re
 readFile($('bm_file'),'import_bookmarks');readFile($('pw_file'),'import_passwords');
 
 $('url').addEventListener('keydown',e=>{if(e.key==='Enter'){send({cmd:'go',text:$('url').value});$('url').blur()}});
+$('url').addEventListener('input',e=>{if(e.inputType)send({cmd:'suggest',q:$('url').value})});
 $('url').addEventListener('focus',e=>e.target.select());
 $('back').onclick=()=>send({cmd:'back'});$('fwd').onclick=()=>send({cmd:'forward'});$('rel').onclick=()=>send({cmd:$('rel').dataset.loading?'stop':'reload'});
 $('home').onclick=()=>send({cmd:'go',text:(S.cfg&&S.cfg.home)||'https://duckduckgo.com/'});
@@ -943,6 +951,7 @@ addEventListener('keydown',e=>{if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='
   if(e.ctrlKey&&e.key==='t'){send({cmd:'new'});e.preventDefault()}
   if(e.ctrlKey&&e.key==='w'){send({cmd:'close',id:S.active});e.preventDefault()}
   if(e.ctrlKey&&e.key==='l'){$('url').focus();e.preventDefault()}
+  if(e.ctrlKey&&!e.shiftKey&&e.key==='h'){send({cmd:'history_open'});e.preventDefault()}
   if(e.ctrlKey&&e.key==='d'){send({cmd:'bookmark'});e.preventDefault()}
   if(e.key==='Escape'){engMenu(false);siteMenu(false);dlMenu(false);if(panelOpen)panel(false)}});
 send({cmd:'ready'});
