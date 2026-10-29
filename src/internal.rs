@@ -4,7 +4,7 @@
 //! here too, since the engine's own internal pages are not part of this browser. Everything is generated on request from
 //! live data, styled with one shared stylesheet (dark and light follow the system).
 
-use crate::{bookmarks, config};
+use crate::{bookmarks, config, ext};
 
 /// Snapshot the app keeps current for the pages.
 /// Blocker numbers the pages show, read from the running blocker.
@@ -193,7 +193,7 @@ pub fn page(name: &str, d: &Internal, stats: &Stats) -> Option<String> {
             let stats = [
                 ("version", format!("IMC Browse {}", env!("CARGO_PKG_VERSION"))),
                 ("gpu", if d.hw { "Hardware acceleration on".into() } else { "Hardware acceleration off".into() }),
-                ("extensions", "Not available yet".to_string()),
+                ("extensions", format!("{} installed", ext::items().len())),
                 ("bookmarks", format!("{} saved", bms.len())),
                 ("blocker", format!("{} blocked this session", stats.blocked)),
                 ("shortcuts", format!("{} gestures set", d.gestures.binds.len())),
@@ -247,11 +247,46 @@ pub fn page(name: &str, d: &Internal, stats: &Stats) -> Option<String> {
             Some(shell("Graphics", "gpu", "Hardware acceleration and GPU flags", &body))
         }
         "extensions" => {
-            let body = format!(
-                "<div class=\"empty\"><b>Browser extensions are not supported in this build yet</b><p>The embedded Chromium runs web pages, but loading Chrome extensions needs more work. The ad and tracker blocker is built into the browser itself.</p></div>{}",
-                note(ICON_INFO, "See <a href=\"imc://blocker\">Blocker</a> for what is filtered, or <a href=\"imc://settings/toolbar\">Settings, Toolbar</a> to arrange the buttons you do have.")
-            );
-            Some(shell("Extensions", "extensions", "Not available yet", &body))
+            let items = ext::items();
+            let body = if items.is_empty() {
+                format!(
+                    "<div class=\"empty\"><b>No extensions installed</b><p>Install a Chrome or Firefox extension from the command line, then restart the browser:</p><p><code>imc-browse --install-extension &lt;Chrome Web Store id | Firefox add-on URL | .crx | .xpi | .zip | folder&gt;</code></p></div>{}",
+                    note(ICON_INFO, "Chrome extensions run on the embedded Chromium's own extension system. Older (Manifest V2) Chrome extensions and most Firefox add-ons are converted to the current format when installed, which works for many but not all of them.")
+                )
+            } else {
+                let mut rows = String::from("<table><tr><th></th><th>Name</th><th>Made for</th><th>Status</th><th>Open</th></tr>");
+                for it in &items {
+                    let img = match &it.icon {
+                        Some(u) => format!("<img class=\"row-ic\" alt=\"\" src=\"{}\">", esc(u)),
+                        None => format!("<div class=\"row-ic\">{}</div>", esc(&it.name.chars().next().unwrap_or('?').to_string())),
+                    };
+                    let mut links = String::new();
+                    if it.error.is_none() {
+                        if let Some(p) = &it.popup {
+                            links.push_str(&format!("<a href=\"chrome-extension://{}/{}\">Popup</a> ", esc(&it.id), esc(p)));
+                        }
+                        if let Some(o) = &it.options {
+                            links.push_str(&format!("<a href=\"chrome-extension://{}/{}\">Options</a>", esc(&it.id), esc(o)));
+                        }
+                    }
+                    if links.is_empty() {
+                        links = "<span class=\"pill\">no page</span>".into();
+                    }
+                    let status = match &it.error {
+                        None => "<span class=\"pill ok\">Loaded</span>".to_string(),
+                        Some(e) => format!("<span class=\"pill bad\">Not loaded</span><br><span style=\"color:var(--dim);font-size:12px\">{}</span>", esc(e)),
+                    };
+                    rows.push_str(&format!(
+                        "<tr><td>{img}</td><td><b>{}</b><br><span class=\"mono\" style=\"color:var(--dim);font-size:12px\">{}</span></td><td>{}</td><td>{status}</td><td>{links}</td></tr>",
+                        esc(&it.name),
+                        esc(&it.id),
+                        if it.firefox { "Firefox" } else { "Chrome" }
+                    ));
+                }
+                rows.push_str("</table>");
+                format!("{rows}{}", note(ICON_INFO, "Remove one with <code>imc-browse --remove-extension &lt;folder&gt;</code> and restart. Pin them to the toolbar in <a href=\"imc://settings/toolbar\">Settings, Toolbar</a>. Extensions that need a persistent background page may not work."))
+            };
+            Some(shell("Extensions", "extensions", &format!("{} installed", items.len()), &body))
         }
         "ai" => {
             let state = |on: bool| if on { "<span class=\"pill ok\">On</span>" } else { "<span class=\"pill\">Off</span>" };

@@ -1,7 +1,8 @@
 //! Extension installer + Firefox compatibility shim.
 //!
-//! Runtime: WebView2's native Chromium extension host (enabled in main.rs), so
-//! `chrome.*` is real, not emulated. This module gets extensions *onto disk* in
+//! Runtime: the embedded Chromium's own extension host (loaded with --load-extension), so
+//! `chrome.*` is real, not emulated. It only runs Manifest V3, so older (MV2) Chrome extensions and
+//! most Firefox add-ons are converted to V3 when installed (best effort, with warnings). This module gets extensions *onto disk* in
 //! the unpacked form that host loads: Chrome Web Store ids, `.crx`, Firefox
 //! `.xpi`/AMO URLs, `.zip`, or an unpacked folder. For Firefox add-ons it adds a
 //! `browser` -> `chrome` alias so `browser.*` code runs unmodified.
@@ -132,31 +133,126 @@ pub fn read_manifest(dir: &Path) -> Option<Value> {
     serde_json::from_str(s.trim_start_matches('\u{feff}')).ok()
 }
 
+fn is_host_pattern(p: &str) -> bool {
+    p == "<all_urls>" || p.contains("://")
+}
+
+/// Moves URL-pattern entries out of `from` into `to` (MV2 mixed them; MV3 separates them).
+fn split_perms(m: &mut Value, from: &str, to: &str) {
+    let Some(arr) = m.get(from).and_then(Value::as_array).cloned() else { return };
+    let (hosts, perms): (Vec<Value>, Vec<Value>) = arr.into_iter().partition(|v| v.as_str().is_some_and(is_host_pattern));
+    m[from] = Value::Array(perms);
+    if !hosts.is_empty() {
+        let mut all = m.get(to).and_then(Value::as_array).cloned().unwrap_or_default();
+        all.extend(hosts);
+        m[to] = Value::Array(all);
+    }
+}
+
+/// Best-effort Manifest V2 -> V3 conversion. Returns warnings about what could not be carried over.
+/// The original is kept as manifest.mv2.json.
+pub fn convert_to_mv3(dir: &Path, m: &mut Value) -> Vec<String> {
+    let mut w = vec![];
+    m["manifest_version"] = json!(3);
+    if let Some(o) = m.as_object_mut() {
+        let a = o.remove("browser_action");
+        let b = o.remove("page_action");
+        if let Some(act) = a.or(b) {
+            o.insert("action".into(), act);
+        }
+        if o.remove("sidebar_action").is_some() {
+            w.push("sidebar panel is not supported and was removed".into());
+        }
+    }
+    split_perms(m, "permissions", "host_permissions");
+    split_perms(m, "optional_permissions", "optional_host_permissions");
+    if let Some(perms) = m.get_mut("permissions").and_then(Value::as_array_mut) {
+        let before = perms.len();
+        perms.retain(|p| !matches!(p.as_str(), Some("webRequestBlocking") | Some("background") | Some("browsingData")));
+        if perms.len() != before {
+            w.push("blocking webRequest and a few legacy permissions are not available in Manifest V3 (the browser has a built-in blocker)".into());
+        }
+    }
+    if let Some(arr) = m.get("web_accessible_resources").and_then(Value::as_array).cloned() {
+        if arr.iter().all(Value::is_string) {
+            m["web_accessible_resources"] = json!([{"resources": arr, "matches": ["<all_urls>"]}]);
+        }
+    }
+    if m["content_security_policy"].is_string() {
+        m["content_security_policy"] = json!({"extension_pages": "script-src 'self'; object-src 'self'"});
+        w.push("custom content security policy replaced with the Manifest V3 default".into());
+    }
+    if let Some(bg) = m.get("background").and_then(Value::as_object).cloned() {
+        if let Some(scripts) = bg.get("scripts").and_then(Value::as_array) {
+            let list: Vec<String> = scripts.iter().filter_map(|v| v.as_str()).map(|s| format!("{:?}", s.trim_start_matches('/'))).collect();
+            let js = format!("// generated: runs the old background scripts in a Manifest V3 service worker\nglobalThis.browser = globalThis.chrome;\nimportScripts({});\n", list.join(", "));
+            if fs::write(dir.join("imc-bg.js"), js).is_ok() {
+                m["background"] = json!({"service_worker": "imc-bg.js"});
+                w.push("background scripts now run as a service worker (no page or DOM); add-ons that need a persistent page may not work".into());
+            }
+        } else if bg.contains_key("page") {
+            m.as_object_mut().map(|o| o.remove("background"));
+            w.push("background page is not supported and was removed".into());
+        }
+    }
+    w
+}
+
+/// Adds the `browser` alias to the extension's own HTML pages (popup, options) so `browser.*` runs there too.
+fn shim_pages(dir: &Path, m: &Value) {
+    let mut pages: Vec<String> = vec![];
+    for p in ["/action/default_popup", "/browser_action/default_popup", "/options_ui/page", "/options_page"] {
+        if let Some(s) = m.pointer(p).and_then(Value::as_str) {
+            pages.push(s.trim_start_matches('/').to_string());
+        }
+    }
+    for page in pages {
+        let path = dir.join(&page);
+        let Ok(html) = fs::read_to_string(&path) else { continue };
+        if html.contains("imc-compat.js") {
+            continue;
+        }
+        let tag = "<script src=\"/imc-compat.js\"></script>";
+        let out = match html.to_ascii_lowercase().find("<head>") {
+            Some(i) => format!("{}{tag}{}", &html[..i + 6], &html[i + 6..]),
+            None => format!("{tag}{html}"),
+        };
+        let _ = fs::write(&path, out);
+    }
+}
+
 fn finish(dir: &Path) -> Result<String, String> {
     let mut m = read_manifest(dir).ok_or("manifest.json missing or invalid")?;
     let firefox = m.get("browser_specific_settings").is_some() || m.get("applications").is_some();
     let mut note = String::new();
+    let mut changed = false;
+    if m["manifest_version"].as_u64().unwrap_or(2) < 3 {
+        let _ = fs::copy(dir.join("manifest.json"), dir.join("manifest.mv2.json"));
+        let warns = convert_to_mv3(dir, &mut m);
+        for w in warns {
+            note.push_str(&format!("\n  note: {w}"));
+        }
+        changed = true;
+    }
     if firefox {
         fs::write(dir.join("imc-compat.js"), COMPAT_JS).map_err(|e| e.to_string())?;
-        let mut patched = false;
-        if let Some(arr) = m.pointer_mut("/background/scripts").and_then(Value::as_array_mut) {
-            arr.insert(0, json!("imc-compat.js"));
-            patched = true;
-        }
         if let Some(cs) = m.get_mut("content_scripts").and_then(Value::as_array_mut) {
             for c in cs {
                 if let Some(js) = c.get_mut("js").and_then(Value::as_array_mut) {
-                    js.insert(0, json!("imc-compat.js"));
-                    patched = true;
+                    if !js.iter().any(|v| v == "imc-compat.js") {
+                        js.insert(0, json!("imc-compat.js"));
+                        changed = true;
+                    }
                 }
             }
         }
-        if m.pointer("/background/service_worker").is_some() {
-            note.push_str(" (MV3 service worker: browser.* alias not injected there)");
+        if m.pointer("/background/service_worker").is_some() && !dir.join("imc-bg.js").exists() {
+            note.push_str("\n  note: MV3 service worker: the browser.* alias is not injected there");
         }
-        if patched {
-            fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&m).unwrap()).map_err(|e| e.to_string())?;
-        }
+        shim_pages(dir, &m);
+    }
+    if changed {
+        fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&m).unwrap()).map_err(|e| e.to_string())?;
     }
     Ok(format!(
         "installed {} {} -> {}{note}\nRestart the browser to load it.",
@@ -164,6 +260,32 @@ fn finish(dir: &Path) -> Result<String, String> {
         m["version"].as_str().unwrap_or(""),
         dir.display()
     ))
+}
+
+/// The id Chromium gives an unpacked extension: SHA-256 of the folder path (as UTF-16), first 16
+/// bytes, written with the letters a-p.
+pub fn id_for_path(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canon = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let text = canon.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    Sha256::digest(&bytes)[..16].iter().flat_map(|b| [b >> 4, b & 15]).map(|n| (b'a' + n) as char).collect()
+}
+
+/// Folders to pass to --load-extension, and the ones skipped (with why), so the engine never shows its own error box.
+pub fn load_dirs() -> (Vec<String>, Vec<(String, String)>) {
+    let (mut ok, mut skipped) = (vec![], vec![]);
+    if let Ok(rd) = fs::read_dir(extensions_dir()) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            match read_manifest(&e.path()) {
+                None => skipped.push((name, "manifest.json is missing or invalid".into())),
+                Some(m) if m["manifest_version"].as_u64() == Some(3) => ok.push(e.path().to_string_lossy().into_owned()),
+                Some(_) => skipped.push((name, "uses the old Manifest V2 format: reinstall it to convert".into())),
+            }
+        }
+    }
+    (ok, skipped)
 }
 
 fn sanitize(s: &str) -> String {
@@ -209,6 +331,12 @@ pub struct Item {
     pub icon: Option<String>,
     pub popup: Option<String>,
     pub options: Option<String>,
+    /// Chromium's id for it (used in chrome-extension:// addresses).
+    pub id: String,
+    /// Why it is not loaded, if it is not.
+    pub error: Option<String>,
+    /// Made for Firefox (it has Firefox-specific settings).
+    pub firefox: bool,
 }
 
 fn b64(data: &[u8]) -> String {
@@ -270,9 +398,52 @@ pub fn items() -> Vec<Item> {
                 icon: icon_uri(&e.path(), &m),
                 popup: act["default_popup"].as_str().map(|s| s.trim_start_matches('/').to_string()),
                 options: m["options_page"].as_str().or_else(|| m["options_ui"]["page"].as_str()).map(|s| s.trim_start_matches('/').to_string()),
+                id: id_for_path(&e.path()),
+                error: (m["manifest_version"].as_u64() != Some(3)).then(|| "old Manifest V2 format: reinstall to convert".to_string()),
+                firefox: m.get("browser_specific_settings").is_some() || m.get("applications").is_some(),
                 dir,
             });
         }
     }
     out
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+
+    #[test]
+    fn mv2_becomes_mv3() {
+        let d = std::env::temp_dir().join(format!("imc-ext-{}", std::process::id()));
+        let _ = fs::create_dir_all(&d);
+        let mut m = json!({
+            "manifest_version": 2, "name": "T", "version": "1",
+            "browser_action": {"default_popup": "p.html"},
+            "permissions": ["storage", "https://a.example/*", "<all_urls>", "webRequestBlocking"],
+            "web_accessible_resources": ["img/x.png"],
+            "content_security_policy": "script-src 'self' 'unsafe-eval'",
+            "background": {"scripts": ["a.js", "/lib/b.js"], "persistent": false}
+        });
+        let w = convert_to_mv3(&d, &mut m);
+        assert_eq!(m["manifest_version"], 3);
+        assert!(m.get("browser_action").is_none() && m["action"]["default_popup"] == "p.html");
+        assert_eq!(m["permissions"], json!(["storage"]));
+        assert_eq!(m["host_permissions"], json!(["https://a.example/*", "<all_urls>"]));
+        assert_eq!(m["web_accessible_resources"][0]["resources"][0], "img/x.png");
+        assert_eq!(m["content_security_policy"]["extension_pages"], "script-src 'self'; object-src 'self'");
+        assert_eq!(m["background"]["service_worker"], "imc-bg.js");
+        let bg = fs::read_to_string(d.join("imc-bg.js")).unwrap();
+        assert!(bg.contains("importScripts(\"a.js\", \"lib/b.js\")"));
+        assert!(w.len() >= 3);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ids_use_only_a_to_p_and_differ_per_path() {
+        let a = id_for_path(Path::new(r"C:\x\one"));
+        let b = id_for_path(Path::new(r"C:\x\two"));
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| (b'a'..=b'p').contains(&c)));
+        assert_ne!(a, b);
+    }
 }

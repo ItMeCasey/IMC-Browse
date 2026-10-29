@@ -12,6 +12,7 @@ mod cards;
 mod config;
 mod control;
 mod downloads;
+mod ext;
 mod passwords;
 mod internal;
 mod sandbox;
@@ -717,6 +718,7 @@ wrap_app! {
                 r.add_custom_scheme(Some(&cs("imc")), 1 | 8); // STANDARD | SECURE
             }
         }
+        // (extensions are passed to the engine here too, see below)
         fn on_before_command_line_processing(&self, process_type: Option<&CefString>, cmd: Option<&mut CommandLine>) {
             let (Some(cmd), true) = (cmd, process_type.is_none_or(|p| p.to_string().is_empty())) else { return };
             for s in ["disable-background-networking", "disable-sync", "disable-component-update", "disable-domain-reliability",
@@ -728,6 +730,10 @@ wrap_app! {
             if !self.hw {
                 cmd.append_switch(Some(&cs("disable-gpu")));
                 cmd.append_switch(Some(&cs("disable-gpu-compositing")));
+            }
+            let (dirs, _) = ext::load_dirs();
+            if !dirs.is_empty() {
+                cmd.append_switch_with_value(Some(&cs("load-extension")), Some(&cs(&dirs.join(","))));
             }
             cmd.append_switch_with_value(Some(&cs("imc-gestures")), Some(&cs(&self.gestures)));
             // Proxy, bypass list and WebRTC leak policy come from the same builder as the WebView2 build.
@@ -781,6 +787,7 @@ struct Shell {
     /// Live data behind the imc:// pages.
     internal: Arc<RwLock<internal::Internal>>,
     /// The AI panel is showing (it is created on first use and kept alive after that).
+    ext_items: Vec<ext::Item>,
     ai_open: bool,
     control_on: Arc<AtomicBool>,
     /// Text waiting for the panel's page to finish loading.
@@ -1607,6 +1614,7 @@ impl Shell {
             "extensions": [],
             "maximized": self.window.is_maximized(),
             "ai": {"open": self.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
+            "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some(), "error": e.error})).collect::<Vec<_>>(),
             "control": {"enabled": self.cfg.control.enabled, "allow_js": self.cfg.control.allow_js},
             "ai_sites": config::AI_SITES.iter().map(|(id, n, _)| json!({"id": id, "name": n})).collect::<Vec<_>>(),
             "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
@@ -1811,6 +1819,18 @@ impl Shell {
                 self.push();
                 if on {
                     self.toast("AI control is on. Programs running as you can now drive this browser. Ghost tabs stay private.");
+                }
+            }
+            "ext_open" => {
+                let dir = m["dir"].as_str().unwrap_or("");
+                let Some(it) = self.ext_items.iter().find(|e| e.dir == dir).cloned() else { return false };
+                match (it.error, it.popup.or(it.options)) {
+                    (Some(e), _) => self.toast(&format!("{} is not loaded: {e}", it.name)),
+                    (None, Some(page)) => {
+                        let n = self.new_tab(&format!("chrome-extension://{}/{page}", it.id), false);
+                        self.activate(n);
+                    }
+                    (None, None) => self.toast("This extension has no popup or options page to open."),
                 }
             }
             "ai_toggle" => {
@@ -2104,7 +2124,7 @@ fn finish() {
 fn cli(args: &[String]) -> bool {
     use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
     let Some(first) = args.first() else { return false };
-    if !["--update-lists", "--version", "--help"].contains(&first.as_str()) {
+    if !["--update-lists", "--version", "--help", "--install-extension", "--list-extensions", "--remove-extension"].contains(&first.as_str()) {
         return false; // anything else is a Chromium switch or a page to open
     }
     unsafe {
@@ -2112,6 +2132,21 @@ fn cli(args: &[String]) -> bool {
     }
     match first.as_str() {
         "--version" => println!("IMC Browse {} (build {})", updater::VERSION, updater::BUILD_ID),
+        "--install-extension" => match args.get(1).map(|s| ext::install(s)) {
+            Some(Ok(m)) => println!("{m}"),
+            Some(Err(e)) => eprintln!("error: {e}"),
+            None => eprintln!("usage: imc-browse --install-extension <Chrome Web Store id | Firefox add-on URL | .crx/.xpi/.zip | https URL | folder>"),
+        },
+        "--list-extensions" => {
+            for it in ext::items() {
+                println!("{}\t{}\t{}{}", it.dir, it.name, if it.firefox { "Firefox" } else { "Chrome" }, it.error.map(|e| format!("\tNOT LOADED: {e}")).unwrap_or_default());
+            }
+        }
+        "--remove-extension" => match args.get(1).map(|s| ext::remove(s)) {
+            Some(Ok(())) => println!("removed (restart the browser)"),
+            Some(Err(e)) => eprintln!("error: {e}"),
+            None => eprintln!("usage: imc-browse --remove-extension <folder-name>"),
+        },
         "--update-lists" => {
             const LISTS: &[(&str, &str)] = &[
                 ("easylist", "https://easylist.to/easylist/easylist.txt"),
@@ -2127,7 +2162,10 @@ fn cli(args: &[String]) -> bool {
             }
         }
         _ => println!("imc-browse [URL...]
-  --update-lists   download the ad and tracker filter lists
+  --update-lists                download the ad and tracker filter lists
+  --install-extension <src>     Chrome Web Store id, Firefox add-on URL, .crx/.xpi/.zip, https URL or folder
+  --list-extensions
+  --remove-extension <name>
   --version"),
     }
     true
@@ -2230,6 +2268,7 @@ fn main() {
         closed: vec![],
         upd: updater::Ctl::new(),
         internal,
+        ext_items: ext::items(),
         ai_open: false,
         control_on: Arc::new(AtomicBool::new(cfg.control.enabled)),
         ai_pending: None,
