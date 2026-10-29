@@ -117,6 +117,8 @@ GROUPS = [
   ("screenshot", p("M4.5 8V6.5a2 2 0 0 1 2-2H8M16 4.5h1.5a2 2 0 0 1 2 2V8M19.5 16v1.5a2 2 0 0 1-2 2H16M8 19.5H6.5a2 2 0 0 1-2-2V16") + '<circle cx="12" cy="12" r="2.5"/>'),
   ("pip",        '<rect x="3.5" y="5.5" width="17" height="13" rx="3"/><rect x="12" y="11.5" width="6" height="4.5" rx="1" fill="currentColor"/>'),
   ("code",       p("M8.5 7 3.5 12l5 5M15.5 7l5 5-5 5")),
+  ("ai",         p("M10.5 6c.8 3.9 1.9 5 5.5 6-3.6 1-4.7 2.1-5.5 6-.8-3.9-1.9-5-5.5-6 3.6-1 4.7-2.1 5.5-6z") + p("M18.5 3.5v4M16.5 5.5h4")),
+  ("ai-off",     p("M10.5 6c.8 3.9 1.9 5 5.5 6-3.6 1-4.7 2.1-5.5 6-.8-3.9-1.9-5-5.5-6 3.6-1 4.7-2.1 5.5-6z") + p("M4.5 4.5l15 15")),
   ("image",      '<rect x="3.5" y="4.5" width="17" height="15" rx="3"/>' + p("M4 17l5-5 4 4 2.5-2.5 4.5 4.5") + dot(15.5, 9.5, 1.4)),
  ]),
  ("Network and errors", [
@@ -270,13 +272,13 @@ USE = {
  "user": "Profile", "grip": "Drag handle (reorder tabs/bookmarks)", "win-min": "Minimize window", "win-max": "Maximize window",
  "win-restore": "Restore window", "fullscreen": "Fullscreen", "print": "Print", "share": "Share page", "link": "Copy link",
  "reader": "Reader mode", "screenshot": "Screenshot", "pip": "Picture-in-picture", "code": "Developer tools / view source",
- "image": "Image / save image", "cookie": "Cookies", "wifi": "Online", "wifi-off": "Offline / no connection",
+ "image": "Image / save image", "ai": "AI assistant / summarize / ask", "ai-off": "AI disabled", "cookie": "Cookies", "wifi": "Online", "wifi-off": "Offline / no connection",
  "page-error": "Page failed to load",
  "info": "Information", "warning": "Warning", "ok": "Success", "error": "Error",
 }
 ALIASES = {"tab-close": "close", "settings": "sliders", "vertical-tabs": "sidebar", "downloads": "download",
            "passwords": "key", "vpn": "globe", "speaker": "sound", "speaker-muted": "mute", "sleeping": "sleep",
-           "new-tab": "plus", "search-engine": "engine", "shield-on": "shield-ok", "bookmark": "star", "duplicate-tab": "copy", "new-window": "window", "reopen-closed-tab": "undo",
+           "new-tab": "plus", "search-engine": "engine", "shield-on": "shield-ok", "bookmark": "star", "assistant": "ai", "sparkle": "ai","duplicate-tab": "copy", "new-window": "window", "reopen-closed-tab": "undo",
            "clear-data": "trash", "find": "search", "devtools": "code", "offline": "wifi-off", "load-error": "page-error",
            "certificate": "shield-ok", "https-upgraded": "lock", "minimize": "win-min", "maximize": "win-max",
            "restore": "win-restore", "profile": "user","bookmark-saved": "star-fill"}

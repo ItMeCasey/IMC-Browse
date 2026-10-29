@@ -1,24 +1,27 @@
 //! imc:// internal pages (version, GPU, extensions, bookmarks, blocker, shortcuts).
 //!
-//! WebView2 serves a custom protocol as `http://imc.localhost/<page>`; the address bar shows it as
-//! `imc://<page>`. `chrome://`, `edge://` and `about:` for the same pages are mapped here too, since
-//! WebView2 blocks most of the browser's own internal pages. Everything is generated on request from
+//! Served by a CEF scheme handler. `chrome://`, `edge://` and `about:` for the same pages are mapped
+//! here too, since the engine's own internal pages are not part of this browser. Everything is generated on request from
 //! live data, styled with one shared stylesheet (dark and light follow the system).
 
-use crate::{bookmarks, config, ext, winhook::Shield};
-use std::sync::atomic::Ordering;
-
-/// Host WebView2 uses for our custom protocol.
-pub const HOST: &str = "imc.localhost";
+use crate::{bookmarks, config};
 
 /// Snapshot the app keeps current for the pages.
+/// Blocker numbers the pages show, read from the running blocker.
+pub struct Stats {
+    pub enabled: bool,
+    pub blocked: usize,
+    pub rules: usize,
+    pub cosmetic: usize,
+}
+
 pub struct Internal {
-    pub webview: String,
+    /// Chromium version of the engine.
+    pub engine: String,
     pub flags: String,
     pub hw: bool,
     pub proxy: String,
     pub doh: String,
-    pub ext_ids: Vec<(String, String)>,
     pub gestures: config::Gestures,
 }
 
@@ -76,20 +79,20 @@ pub fn from_typed(text: &str) -> Option<String> {
         n => n,
     };
     let sub = rest.split_once('/').map(|(_, s)| s).unwrap_or("");
-    Some(if sub.is_empty() { format!("http://{HOST}/{name}") } else { format!("http://{HOST}/{name}/{sub}") })
+    Some(if sub.is_empty() { format!("imc://{name}") } else { format!("imc://{name}/{sub}") })
 }
 
-/// Real URL -> what the address bar shows.
-pub fn display(url: &str) -> Option<String> {
-    url.strip_prefix(&format!("http://{HOST}/")).map(|r| format!("imc://{}", r.trim_end_matches('/')))
-}
-
-/// `settings` page request -> the settings section to open (empty = General).
+/// `imc://settings[/section]` -> the settings section to open (General when none or unknown).
 pub fn settings_section(url: &str) -> Option<String> {
-    let r = url.strip_prefix(&format!("http://{HOST}/settings"))?;
+    let r = url.strip_prefix("imc://settings")?;
     let sec = r.trim_matches('/');
-    let ok = ["general", "theme", "bookmarks", "passwords", "cards", "privacy", "toolbar", "gestures"];
+    let ok = ["general", "theme", "bookmarks", "passwords", "cards", "privacy", "toolbar", "gestures", "updates"];
     Some(if ok.contains(&sec) { sec.to_string() } else { "general".to_string() })
+}
+
+/// The page name in an `imc://name/...` URL ("" for the index).
+pub fn page_name(url: &str) -> String {
+    url.strip_prefix("imc://").unwrap_or("").split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase()
 }
 
 const CSS: &str = r#"
@@ -150,14 +153,14 @@ fn shell(title: &str, active: &str, sub: &str, body: &str) -> String {
         nav.push_str(&format!("<a class=\"{}\" href=\"imc://{n}\">{}{}</a>", if *n == active { "on" } else { "" }, icon(n), label));
     }
     nav.push_str(&format!("<div class=\"sp\"></div><a href=\"imc://settings\">{}Settings</a>", icon("settings")));
-    let html = format!(
+    format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{} - IMC Browse</title><style>{CSS}</style></head><body><div class=\"app\"><nav><div class=\"brand\"><i>IMC</i>IMC Browse</div>{nav}</nav><main><h1>{}</h1><p class=\"sub\">{}</p>{body}</main></div></body></html>",
         esc(title),
         esc(title),
         esc(sub)
-    );
-    html.replace("href=\"imc://\"", &format!("href=\"http://{HOST}/\"")).replace("href=\"imc://", &format!("href=\"http://{HOST}/"))
+    )
 }
+
 
 fn kv(rows: &[(&str, String)]) -> String {
     let mut s = String::from("<table>");
@@ -177,17 +180,16 @@ fn arrows(path: &str) -> String {
 }
 
 /// Dark/light page for `imc://<name>`; None for unknown names.
-pub fn page(name: &str, d: &Internal, shield: &Shield) -> Option<String> {
+pub fn page(name: &str, d: &Internal, stats: &Stats) -> Option<String> {
     let bms = bookmarks::load();
-    let exts = ext::list();
     match name {
         "" => {
             let stats = [
                 ("version", format!("IMC Browse {}", env!("CARGO_PKG_VERSION"))),
                 ("gpu", if d.hw { "Hardware acceleration on".into() } else { "Hardware acceleration off".into() }),
-                ("extensions", format!("{} installed", exts.len())),
+                ("extensions", "Not available yet".to_string()),
                 ("bookmarks", format!("{} saved", bms.len())),
-                ("blocker", format!("{} blocked this session", shield.blocked.load(Ordering::Relaxed))),
+                ("blocker", format!("{} blocked this session", stats.blocked)),
                 ("shortcuts", format!("{} gestures set", d.gestures.binds.len())),
             ];
             let mut cards = String::new();
@@ -202,7 +204,7 @@ pub fn page(name: &str, d: &Internal, shield: &Shield) -> Option<String> {
         "version" => {
             let b = vec![
                 ("IMC Browse", env!("CARGO_PKG_VERSION").to_string()),
-                ("Engine", format!("Chromium (WebView2 runtime {})", esc(&d.webview))),
+                ("Engine", format!("Chromium {} (embedded)", esc(&d.engine))),
                 ("Operating system", format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)),
                 ("Hardware acceleration", if d.hw { "<span class=\"pill ok\">On</span>".into() } else { "<span class=\"pill\">Off</span>".into() }),
                 ("Proxy", esc(&d.proxy)),
@@ -239,45 +241,11 @@ pub fn page(name: &str, d: &Internal, shield: &Shield) -> Option<String> {
             Some(shell("Graphics", "gpu", "Hardware acceleration and GPU flags", &body))
         }
         "extensions" => {
-            let items = ext::items();
-            let body = if items.is_empty() {
-                format!(
-                    "<div class=\"empty\"><b>No extensions installed</b><p>Install one from the command line, then restart the browser:</p><p><code>imc-browse.exe --install-extension &lt;Web Store id | .crx | .xpi | https URL | folder&gt;</code></p></div>{}",
-                    note(ICON_INFO, "Extensions run inside the engine. They can be added to the toolbar from <a href=\"imc://settings/toolbar\">Settings, Toolbar</a>; popups open as a tab.")
-                )
-            } else {
-                let mut rows = String::from("<table><tr><th></th><th>Name</th><th>Version</th><th>Folder</th><th>Open</th></tr>");
-                for it in &items {
-                    let ver = exts.iter().find(|(dir, _, _)| *dir == it.dir).map(|(_, _, v)| v.clone()).unwrap_or_default();
-                    let id = d.ext_ids.iter().find(|(_, n)| *n == it.name).map(|(i, _)| i.clone());
-                    let img = match &it.icon {
-                        Some(u) => format!("<img class=\"row-ic\" alt=\"\" src=\"{}\">", esc(u)),
-                        None => format!("<div class=\"row-ic\">{}</div>", esc(&it.name.chars().next().unwrap_or('?').to_string())),
-                    };
-                    let mut links = String::new();
-                    if let Some(id) = &id {
-                        if let Some(p) = &it.popup {
-                            links.push_str(&format!("<a href=\"chrome-extension://{}/{}\">Popup</a> ", esc(id), esc(p)));
-                        }
-                        if let Some(o) = &it.options {
-                            links.push_str(&format!("<a href=\"chrome-extension://{}/{}\">Options</a>", esc(id), esc(o)));
-                        }
-                    }
-                    if links.is_empty() {
-                        links = "<span class=\"pill\">no page</span>".into();
-                    }
-                    rows.push_str(&format!(
-                        "<tr><td>{img}</td><td><b>{}</b><br><span class=\"mono\" style=\"color:var(--dim);font-size:12px\">{}</span></td><td>{}</td><td><code>{}</code></td><td>{links}</td></tr>",
-                        esc(&it.name),
-                        esc(&id.unwrap_or_else(|| "id loading".into())),
-                        esc(&ver),
-                        esc(&it.dir)
-                    ));
-                }
-                rows.push_str("</table>");
-                format!("{rows}{}", note(ICON_INFO, "Remove one with <code>imc-browse.exe --remove-extension &lt;folder&gt;</code>. Pin them to the toolbar in <a href=\"imc://settings/toolbar\">Settings, Toolbar</a>."))
-            };
-            Some(shell("Extensions", "extensions", &format!("{} installed", items.len()), &body))
+            let body = format!(
+                "<div class=\"empty\"><b>Browser extensions are not supported in this build yet</b><p>The embedded Chromium runs web pages, but loading Chrome extensions needs more work. The ad and tracker blocker is built into the browser itself.</p></div>{}",
+                note(ICON_INFO, "See <a href=\"imc://blocker\">Blocker</a> for what is filtered, or <a href=\"imc://settings/toolbar\">Settings, Toolbar</a> to arrange the buttons you do have.")
+            );
+            Some(shell("Extensions", "extensions", "Not available yet", &body))
         }
         "bookmarks" => {
             let body = if bms.is_empty() {
@@ -301,14 +269,12 @@ pub fn page(name: &str, d: &Internal, shield: &Shield) -> Option<String> {
             Some(shell("Bookmarks", "bookmarks", &format!("{} saved", bms.len()), &body))
         }
         "blocker" => {
-            let on = shield.enabled.load(Ordering::Relaxed);
-            let eng = shield.engine.read().unwrap().clone();
-            let stats = format!(
+                        let stats = format!(
                 "<div class=\"stats\"><div class=\"stat-card\"><div class=\"l\">Status</div><div class=\"n\">{}</div></div><div class=\"stat-card\"><div class=\"l\">Blocked this session</div><div class=\"n\">{}</div></div><div class=\"stat-card\"><div class=\"l\">Network rules</div><div class=\"n\">{}</div></div><div class=\"stat-card\"><div class=\"l\">Cosmetic filters</div><div class=\"n\">{}</div></div></div>",
-                if on { "<span class=\"pill ok\">On</span>" } else { "<span class=\"pill bad\">Off</span>" },
-                shield.blocked.load(Ordering::Relaxed),
-                eng.rule_count,
-                eng.cosmetic.len()
+                if stats.enabled { "<span class=\"pill ok\">On</span>" } else { "<span class=\"pill bad\">Off</span>" },
+                stats.blocked,
+                stats.rules,
+                stats.cosmetic
             );
             let mut lists = String::from("<table><tr><th>List</th><th>Size</th><th>Updated</th></tr><tr><td><b>Built-in baseline</b></td><td>embedded</td><td>ships with the browser</td></tr>");
             if let Ok(rd) = std::fs::read_dir(config::lists_dir()) {

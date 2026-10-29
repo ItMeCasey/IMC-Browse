@@ -8,6 +8,7 @@ mod adblock;
 mod bookmarks;
 mod config;
 mod downloads;
+mod internal;
 mod sandbox;
 mod updater;
 mod vpn;
@@ -19,7 +20,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -64,6 +65,7 @@ enum Ev {
     /// A drawn gesture path (U/D/L/R) reported by a page.
     Gesture(String),
     Download(DlEvent),
+    Toast(String),
     Update(updater::UpdMsg),
     /// Zoom request from a page: "in", "out" or "reset".
     Zoom(String),
@@ -261,8 +263,19 @@ wrap_resource_request_handler! {
 wrap_request_handler! {
     struct Req {
         shield: Arc<Shield>,
+        tx: EventLoopProxy<Ev>,
     }
     impl RequestHandler {
+        // imc://settings opens the settings panel instead of loading a page
+        fn on_before_browse(&self, _b: Option<&mut Browser>, _f: Option<&mut Frame>, request: Option<&mut Request>, _gesture: i32, _redirect: i32) -> i32 {
+            let Some(request) = request else { return 0 };
+            let url = CefString::from(&request.url()).to_string();
+            if let Some(section) = internal::settings_section(&url) {
+                let _ = self.tx.send_event(Ev::Ipc(json!({"cmd": "open_settings", "section": section}).to_string()));
+                return 1;
+            }
+            0
+        }
         // IO thread, once per request: decide here so allowed requests cost no allocation.
         fn resource_request_handler(
             &self,
@@ -274,12 +287,18 @@ wrap_request_handler! {
             initiator: Option<&CefString>,
             _disable: Option<&mut i32>,
         ) -> Option<ResourceRequestHandler> {
+            let request = request?;
+            let url = CefString::from(&request.url()).to_string();
+            // imc:// pages are private to the browser: other sites may not load them as subresources
+            if url.starts_with("imc://") {
+                let from = initiator.map(|i| i.to_string()).unwrap_or_default();
+                let kind = kind_of(&request.resource_type());
+                return (kind != adblock::T_DOC && !from.is_empty() && !from.starts_with("imc://")).then(Cancel::new);
+            }
             let down = self.shield.kill_switch && vpn::TUNNEL_DOWN.load(Ordering::Relaxed);
             if !down && !self.shield.enabled.load(Ordering::Relaxed) {
                 return None;
             }
-            let request = request?;
-            let url = CefString::from(&request.url()).to_string();
             if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("ws")) {
                 return None;
             }
@@ -391,6 +410,114 @@ wrap_download_handler! {
     }
 }
 
+/// Serves imc:// pages from memory.
+wrap_resource_handler! {
+    struct ImcRes {
+        body: Arc<Vec<u8>>,
+        status: i32,
+        pos: Arc<AtomicUsize>,
+    }
+    impl ResourceHandler {
+        fn open(&self, _r: Option<&mut Request>, handle_request: Option<&mut i32>, _cb: Option<&mut Callback>) -> i32 {
+            if let Some(h) = handle_request {
+                *h = 1; // we have the whole page already
+            }
+            1
+        }
+        fn response_headers(&self, response: Option<&mut Response>, length: Option<&mut i64>, _redirect: Option<&mut CefString>) {
+            if let Some(r) = response {
+                r.set_status(self.status);
+                r.set_mime_type(Some(&cs("text/html")));
+                for (k, v) in [
+                    ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'"),
+                    ("X-Frame-Options", "DENY"),
+                    ("Cache-Control", "no-store"),
+                ] {
+                    r.set_header_by_name(Some(&cs(k)), Some(&cs(v)), 1);
+                }
+            }
+            if let Some(l) = length {
+                *l = self.body.len() as i64;
+            }
+        }
+        fn read(&self, data_out: *mut u8, bytes_to_read: i32, bytes_read: Option<&mut i32>, _cb: Option<&mut ResourceReadCallback>) -> i32 {
+            let pos = self.pos.load(Ordering::Relaxed);
+            let n = (self.body.len().saturating_sub(pos)).min(bytes_to_read.max(0) as usize);
+            if n > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(self.body[pos..].as_ptr(), data_out, n) };
+                self.pos.store(pos + n, Ordering::Relaxed);
+            }
+            if let Some(b) = bytes_read {
+                *b = n as i32;
+            }
+            (n > 0) as i32
+        }
+    }
+}
+
+wrap_scheme_handler_factory! {
+    struct ImcSchemes {
+        data: Arc<RwLock<internal::Internal>>,
+        shield: Arc<Shield>,
+    }
+    impl SchemeHandlerFactory {
+        fn create(&self, _b: Option<&mut Browser>, _f: Option<&mut Frame>, _scheme: Option<&CefString>, request: Option<&mut Request>) -> Option<ResourceHandler> {
+            let url = CefString::from(&request?.url()).to_string();
+            let name = internal::page_name(&url);
+            let stats = internal::Stats {
+                enabled: self.shield.enabled.load(Ordering::Relaxed),
+                blocked: self.shield.blocked.load(Ordering::Relaxed),
+                rules: self.shield.engine.rule_count,
+                cosmetic: self.shield.engine.cosmetic.len(),
+            };
+            let (status, html) = match internal::page(&name, &self.data.read().unwrap(), &stats) {
+                Some(h) => (200, h),
+                None => (404, internal::not_found(&name)),
+            };
+            Some(ImcRes::new(Arc::new(html.into_bytes()), status, Arc::new(AtomicUsize::new(0))))
+        }
+    }
+}
+
+// Deletes every cookie whose domain belongs to `site` (the registrable domain, so subdomains go too).
+wrap_cookie_visitor! {
+    struct CookieSweep {
+        site: String,
+        deleted: Arc<AtomicUsize>,
+        tx: EventLoopProxy<Ev>,
+    }
+    impl CookieVisitor {
+        fn visit(&self, cookie: Option<&Cookie>, count: i32, total: i32, delete_cookie: Option<&mut i32>) -> i32 {
+            if let Some(c) = cookie {
+                let domain = c.domain.to_string();
+                let d = domain.trim_start_matches('.');
+                if d == self.site || d.ends_with(&format!(".{}", self.site)) {
+                    if let Some(del) = delete_cookie {
+                        *del = 1;
+                    }
+                    self.deleted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if count + 1 >= total {
+                let _ = self.tx.send_event(Ev::Toast(format!("Cleared {} cookies for {}.", self.deleted.load(Ordering::Relaxed), self.site)));
+            }
+            1
+        }
+    }
+}
+
+// CEF wants a completion callback for cache clearing; this one tells the user when it is done.
+wrap_completion_callback! {
+    struct CacheDone {
+        tx: EventLoopProxy<Ev>,
+    }
+    impl CompletionCallback {
+        fn on_complete(&self) {
+            let _ = self.tx.send_event(Ev::Toast("Cleared the browser cache.".into()));
+        }
+    }
+}
+
 wrap_client! {
     struct Cl {
         id: usize,
@@ -410,7 +537,7 @@ wrap_client! {
             Some(Life::new(self.tx.clone()))
         }
         fn request_handler(&self) -> Option<RequestHandler> {
-            self.shield.clone().map(Req::new)
+            self.shield.clone().map(|s| Req::new(s, self.tx.clone()))
         }
         fn download_handler(&self) -> Option<DownloadHandler> {
             (self.id != UI_ID).then(|| Dl::new(self.tx.clone(), self.private, self.dl_ids.clone()))
@@ -461,6 +588,12 @@ wrap_app! {
             Some(Rph::new())
         }
         // Same privacy posture as the WebView2 build: no background phoning home.
+        // imc:// is a real (standard, secure) scheme so internal pages get proper origins.
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            if let Some(r) = registrar {
+                r.add_custom_scheme(Some(&cs("imc")), 1 | 8); // STANDARD | SECURE
+            }
+        }
         fn on_before_command_line_processing(&self, process_type: Option<&CefString>, cmd: Option<&mut CommandLine>) {
             let (Some(cmd), true) = (cmd, process_type.is_none_or(|p| p.to_string().is_empty())) else { return };
             for s in ["disable-background-networking", "disable-sync", "disable-component-update", "disable-domain-reliability",
@@ -519,6 +652,8 @@ struct Shell {
     /// URLs of recently closed tabs (not Ghost), newest last.
     closed: Vec<String>,
     upd: updater::Ctl,
+    /// Live data behind the imc:// pages.
+    internal: Arc<RwLock<internal::Internal>>,
     downloads: Vec<downloads::Item>,
     dl_ids: Arc<AtomicU64>,
     last_dl_push: Instant,
@@ -549,6 +684,9 @@ fn search_base(engine: &str) -> &'static str {
 
 fn normalize(t: &str, engine: &str) -> String {
     let t = t.trim();
+    if let Some(u) = internal::from_typed(t) {
+        return u;
+    }
     let lower = t.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("file://") {
         return t.into();
@@ -624,7 +762,7 @@ impl Shell {
             }
         }
         if std::env::var_os("IMC_SELFTEST").is_some() {
-            let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.active { "*" } else { "" })).collect();
+            let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}|{}|{}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.active { "*" } else { "" }, t.url, t.title)).collect();
             eprintln!("SELFTEST tabs [{}] ghost_ctx={}", sum.join(" "), self.ghost_ctx.is_some());
             eprintln!("SELFTEST downloads {:?}", self.downloads.iter().map(|d| (d.name.clone(), d.state.clone(), d.received, d.total, d.path.clone())).collect::<Vec<_>>());
         }
@@ -817,6 +955,84 @@ impl Shell {
             self.upd.start_install(send);
         }
         self.push_update();
+    }
+
+    /// Refreshes what the imc:// pages show about the running browser.
+    fn sync_internal(&self) {
+        let mut d = self.internal.write().unwrap();
+        d.engine = format!("{}.{}.{}.{}", sys::CHROME_VERSION_MAJOR, sys::CHROME_VERSION_MINOR, sys::CHROME_VERSION_BUILD, sys::CHROME_VERSION_PATCH);
+        d.flags = std::env::args().skip(1).filter(|a| a.starts_with("--")).collect::<Vec<_>>().join("
+");
+        d.hw = self.cfg.hardware_acceleration;
+        d.proxy = if self.cfg.vpn.enabled { format!("{} {}:{}{}", self.cfg.vpn.kind, self.cfg.vpn.host, self.cfg.vpn.port, if self.cfg.vpn.kill_switch { " (kill switch on)" } else { "" }) } else { "Direct connection (no proxy)".into() };
+        d.gestures = self.cfg.gestures.clone();
+        d.doh = self.cfg.doh.describe();
+    }
+
+    /// Certificate and connection details for the open page (the lock popup).
+    fn site_info(&self) {
+        let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        let url = t.url.clone();
+        let web = url.starts_with("http://") || url.starts_with("https://");
+        // Windows FILETIME-style base time (microseconds since 1601) -> unix seconds
+        let unix = |b: Basetime| b.val / 1_000_000 - 11_644_473_600;
+        let mut cert = Value::Null;
+        if let Some(entry) = BROWSERS.with(|m| m.borrow().get(&t.id).and_then(|b| b.host()).and_then(|h| h.visible_navigation_entry())) {
+            if let Some(ssl) = entry.sslstatus().filter(|s| s.is_secure_connection() != 0) {
+                let version = match ssl.sslversion() {
+                    v if v == SslVersion::from(sys::cef_ssl_version_t::SSL_CONNECTION_VERSION_TLS1_3) => "TLS 1.3",
+                    v if v == SslVersion::from(sys::cef_ssl_version_t::SSL_CONNECTION_VERSION_TLS1_2) => "TLS 1.2",
+                    v if v == SslVersion::from(sys::cef_ssl_version_t::SSL_CONNECTION_VERSION_QUIC) => "QUIC",
+                    _ => "",
+                };
+                if let Some(x) = ssl.x509_certificate() {
+                    let name = |p: Option<X509CertPrincipal>| p.map(|p| CefString::from(&p.display_name()).to_string()).unwrap_or_default();
+                    cert = json!({"subject": name(x.subject()), "issuer": name(x.issuer()), "from": unix(x.valid_start()), "to": unix(x.valid_expiry()),
+                                  "protocol": version, "cipher": "", "keyExchange": "", "error": Value::Null});
+                }
+            }
+        }
+        let info = json!({"url": url, "host": host_of(&url), "secure": url.starts_with("https://"), "local": !web, "internal": url.starts_with("imc://"), "cert": cert, "clearable": web});
+        if std::env::var_os("IMC_SELFTEST").is_some() {
+            eprintln!("SELFTEST siteinfo {info}");
+        }
+        self.eval_ui(&format!("window.ui.siteInfo({info})"));
+    }
+
+    /// Clears cookies, site data or the HTTP cache. Site data runs in the page, so it covers that page's origin.
+    fn site_clear(&self, kind: &str) {
+        let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        let site = adblock::registrable(host_of(&t.url)).to_string();
+        let Some(browser) = BROWSERS.with(|m| m.borrow().get(&t.id).cloned()) else { return };
+        let Some(host) = browser.host() else { return };
+        let ctx = host.request_context();
+        match kind {
+            "cookies" => {
+                let manager = ctx.and_then(|c| c.cookie_manager(None));
+                let mut visitor = CookieSweep::new(site.clone(), Arc::new(AtomicUsize::new(0)), self.tx.clone());
+                if !manager.is_some_and(|m| m.visit_all_cookies(Some(&mut visitor)) != 0) {
+                    self.toast("Could not clear cookies.");
+                }
+            }
+            "data" => {
+                if let Some(f) = browser.main_frame() {
+                    let js = "(async()=>{try{localStorage.clear();sessionStorage.clear()}catch(e){}\
+                        try{for(const k of await caches.keys())await caches.delete(k)}catch(e){}\
+                        try{for(const d of await indexedDB.databases())indexedDB.deleteDatabase(d.name)}catch(e){}\
+                        try{for(const r of await navigator.serviceWorker.getRegistrations())await r.unregister()}catch(e){}\
+                        location.reload()})()";
+                    f.execute_java_script(Some(&cs(js)), Some(&cs("imc://clear")), 0);
+                    self.toast(&format!("Cleared site data for {}. Reloading.", host_of(&t.url)));
+                }
+            }
+            "cache" => {
+                if let Some(c) = ctx {
+                    let mut done = CacheDone::new(self.tx.clone());
+                    c.clear_http_cache(Some(&mut done));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn on_download(&mut self, e: DlEvent) {
@@ -1058,6 +1274,7 @@ impl Shell {
                     g.min_distance = g.min_distance.clamp(10, 120);
                     self.cfg.gestures = g;
                     self.cfg.save();
+                    self.sync_internal();
                     let page = self.cfg.gestures.page_config();
                     *self.shield.gest.write().unwrap() = page.clone();
                     let js = format!("window.__imcGset&&window.__imcGset({page})");
@@ -1091,17 +1308,10 @@ impl Shell {
             }
             "scroll_top" => self.eval_page("window.scrollTo({top:0,behavior:'smooth'})"),
             "scroll_bottom" => self.eval_page("window.scrollTo({top:document.documentElement.scrollHeight,behavior:'smooth'})"),
-            "site_info" => {
-                let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return false };
-                let web = t.url.starts_with("http://") || t.url.starts_with("https://");
-                let info = json!({"url": t.url, "host": host_of(&t.url), "secure": t.url.starts_with("https://"), "local": !web, "cert": Value::Null, "clearable": false,
-                    "note": "Certificate details and clearing site data are available in the WebView2 build for now."});
-                self.eval_ui(&format!("window.ui.siteInfo({info})"));
-            }
-            "site_clear" => self.toast("Clearing site data is not in the CEF build yet."),
             "hwaccel" => {
                 self.cfg.hardware_acceleration = m["enabled"].as_bool().unwrap_or(true);
                 self.cfg.save();
+                self.sync_internal();
             }
             "restart" => {
                 self.relaunch();
@@ -1117,12 +1327,21 @@ impl Shell {
                     strict: m["strict"].as_bool().unwrap_or(false),
                 };
                 self.cfg.save();
+                self.sync_internal();
                 if self.cfg.doh.enabled && self.cfg.doh.template().is_none() {
                     self.toast("That server address is not valid. It must start with https://");
                 } else {
                     self.toast("Secure DNS saved. Restart the browser to apply it.");
                 }
             }
+            "open_settings" => {
+                let sec = m["section"].as_str().unwrap_or("general").to_string();
+                self.eval_ui(&format!("panel(true);section({})", Value::String(sec)));
+            }
+            // Dev hook (only with IMC_SELFTEST): run script in the active page.
+            "selftest_eval" if std::env::var_os("IMC_SELFTEST").is_some() => self.eval_page(m["js"].as_str().unwrap_or("")),
+            "site_info" => self.site_info(),
+            "site_clear" => self.site_clear(m["kind"].as_str().unwrap_or("")),
             "dl_list" => self.push_downloads(true),
             "dl_open" | "dl_show" | "dl_cancel" | "dl_remove" => {
                 let id = m["id"].as_u64().unwrap_or(0);
@@ -1364,6 +1583,11 @@ fn main() {
         )
     };
     let shield = Arc::new(Shield { engine, css_js, enabled: AtomicBool::new(cfg.adblock), blocked: AtomicUsize::new(0), kill_switch: cfg.vpn.enabled && cfg.vpn.kill_switch, gest: std::sync::RwLock::new(cfg.gestures.page_config()) });
+    let internal = Arc::new(RwLock::new(internal::Internal { engine: String::new(), flags: String::new(), hw: true, proxy: String::new(), doh: String::new(), gestures: cfg.gestures.clone() }));
+    {
+        let mut factory = ImcSchemes::new(internal.clone(), shield.clone());
+        register_scheme_handler_factory(Some(&cs("imc")), None, Some(&mut factory));
+    }
     let downloads = downloads::load();
     let mut state = Shell {
         window,
@@ -1379,6 +1603,7 @@ fn main() {
         ghost_ctx: None,
         closed: vec![],
         upd: updater::Ctl::new(),
+        internal,
         dl_ids: Arc::new(AtomicU64::new(downloads.iter().map(|d| d.id).max().unwrap_or(0) + 1)),
         downloads,
         last_dl_push: Instant::now(),
@@ -1399,6 +1624,7 @@ fn main() {
             first = id;
         }
     }
+    state.sync_internal();
     state.activate(first);
     let p_tick = tx.clone();
     std::thread::spawn(move || loop {
@@ -1424,6 +1650,23 @@ fn main() {
         });
     }
 
+    if std::env::var_os("IMC_SELFTEST_SITE").is_some() {
+        let t3 = tx.clone();
+        std::thread::spawn(move || {
+            let send = |ms: u64, v: Value| {
+                std::thread::sleep(Duration::from_millis(ms));
+                let _ = t3.send_event(Ev::Ipc(v.to_string()));
+            };
+            send(6000, json!({"cmd": "selftest_eval", "js": "document.cookie='imc_test=1; path=/'; document.cookie='imc_test2=2; path=/'"}));
+            send(1500, json!({"cmd": "site_info"}));
+            let which = std::env::var("IMC_SELFTEST_SITE").unwrap_or_default();
+            for kind in ["cookies", "data", "cache"] {
+                if which == "all" || which == kind {
+                    send(1500, json!({"cmd": "site_clear", "kind": kind}));
+                }
+            }
+        });
+    }
     event_loop.run(move |event, _, flow| {
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -1446,7 +1689,7 @@ fn main() {
                 }
                 Ev::Url(id, u) => {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id && !t.frozen) {
-                        t.url = u;
+                        t.url = if u.starts_with("imc://") { u.trim_end_matches('/').to_string() } else { u };
                     }
                     state.apply_zoom(id);
                     state.push();
@@ -1478,6 +1721,12 @@ fn main() {
                 Ev::Zoom(d) => state.zoom_cmd(&d),
                 Ev::Update(m) => state.on_update(m),
                 Ev::Download(e) => state.on_download(e),
+                Ev::Toast(m) => {
+                    if std::env::var_os("IMC_SELFTEST").is_some() {
+                        eprintln!("SELFTEST toast {m}");
+                    }
+                    state.toast(&m)
+                }
                 Ev::Gesture(path) => {
                     if state.gesture(&path) {
                         finish();

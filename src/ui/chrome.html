@@ -686,7 +686,7 @@ window.ui={
   document.body.classList.toggle('ghost',!!(a&&a.private));
   renderToolbar();
   $('rel').innerHTML=gl(a&&a.loading?'stop':'reload',18);$('rel').title=a&&a.loading?'Stop loading':'Reload';$('rel').dataset.loading=a&&a.loading?'1':'';
-  const u=(a&&a.url)||'';$('lock').innerHTML=u.startsWith('https://')?gl('lock',14):u.startsWith('http://')?gl('unlock',14):'';
+  const u=(a&&a.url)||'';$('lock').innerHTML=u.startsWith('https://')||u.startsWith('imc://')?gl('lock',14):u.startsWith('http://')?gl('unlock',14):'';
   $('lock').className=u.startsWith('http://')?'bad':'';$('lock').title=u.startsWith('https://')?'Secure connection (HTTPS)':u.startsWith('http://')?'Not secure (HTTP)':'';
   const zm=(a&&a.zoom)||100;$('zoomind').style.display=zm===100?'none':'flex';$('zoomind').innerHTML=gl(zm>100?'zoom-in':'zoom-out',13)+'<span>'+zm+'%</span>';$('zoomind').title='Zoom '+zm+'% (click to reset to 100%)';$('urlbox').classList.toggle('zoomed',zm!==100);
   $('wmax').innerHTML=gl(s.maximized?'win-restore':'win-max',14);$('wmax').title=s.maximized?'Restore':'Maximize';
@@ -718,7 +718,7 @@ window.ui={
  siteInfo(i){
   const el=$('siteinfo');el.textContent='';
   const h=document.createElement('h4');h.className=i.secure?'ok':'bad';
-  h.innerHTML=gl(i.secure?'lock':'unlock',16)+'<span>'+(i.secure?'Connection is secure':i.local?'Local file':'Connection is not secure')+'</span>';
+  h.className=i.internal?'ok':h.className;h.innerHTML=gl(i.secure||i.internal?'lock':'unlock',16)+'<span>'+(i.internal?'IMC Browse internal page':i.secure?'Connection is secure':i.local?'Local file':'Connection is not secure')+'</span>';
   const host=document.createElement('div');host.className='host';host.textContent=i.host||i.url;el.append(h,host);
   const dl=document.createElement('dl');
   const row=(k,v)=>{if(!v)return;const a=document.createElement('dt'),b=document.createElement('dd');a.textContent=k;b.textContent=v;dl.append(a,b)};
