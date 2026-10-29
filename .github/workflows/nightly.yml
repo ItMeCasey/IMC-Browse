@@ -22,7 +22,7 @@ jobs:
       changed: ${{ steps.d.outputs.changed }}
       marker: ${{ steps.c.outputs.marker }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: What would change?
         id: c
         run: |
