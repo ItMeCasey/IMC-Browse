@@ -18,8 +18,28 @@ use std::{
 
 const COMPAT_JS: &str = "if (typeof globalThis.browser === 'undefined' && typeof globalThis.chrome !== 'undefined') { globalThis.browser = globalThis.chrome; }\n";
 
+/// The 32-letter extension id in a Chrome Web Store address, or the .xpi address for a Firefox add-on page.
+fn store_link(src: &str) -> Option<String> {
+    let rest = src.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    if host == "chromewebstore.google.com" || (host == "chrome.google.com" && path.starts_with("webstore")) {
+        let id = path.split(['/', '?', '#']).find(|s| s.len() == 32 && s.bytes().all(|b| (b'a'..=b'p').contains(&b)))?;
+        return Some(id.to_string());
+    }
+    if host == "addons.mozilla.org" {
+        let mut parts = path.split(['/', '?', '#']);
+        parts.find(|p| *p == "addon")?;
+        let slug = parts.next().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'%' || b == b'.'))?;
+        return Some(format!("https://addons.mozilla.org/firefox/downloads/latest/{slug}/latest.xpi"));
+    }
+    None
+}
+
 pub fn install(src: &str) -> Result<String, String> {
     let src = src.trim();
+    if let Some(found) = store_link(src) {
+        return install(&found);
+    }
     let is_cws_id = src.len() == 32 && src.bytes().all(|b| (b'a'..=b'p').contains(&b));
     if is_cws_id {
         let url = format!(
@@ -273,11 +293,26 @@ pub fn id_for_path(dir: &Path) -> String {
 }
 
 /// Folders to pass to --load-extension, and the ones skipped (with why), so the engine never shows its own error box.
+/// A disabled extension keeps its files; a marker file inside its folder tells the browser not to load it.
+const DISABLED_MARK: &str = ".imc-disabled";
+
+pub fn set_enabled(dir: &str, on: bool) -> Result<(), String> {
+    let d = extensions_dir().join(sanitize(dir));
+    if !d.is_dir() {
+        return Err(format!("no such extension: {dir}"));
+    }
+    let mark = d.join(DISABLED_MARK);
+    if on { let _ = fs::remove_file(mark); Ok(()) } else { fs::write(mark, b"").map_err(|e| e.to_string()) }
+}
+
 pub fn load_dirs() -> (Vec<String>, Vec<(String, String)>) {
     let (mut ok, mut skipped) = (vec![], vec![]);
     if let Ok(rd) = fs::read_dir(extensions_dir()) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
+            if e.path().join(DISABLED_MARK).exists() {
+                continue;
+            }
             match read_manifest(&e.path()) {
                 None => skipped.push((name, "manifest.json is missing or invalid".into())),
                 Some(m) if m["manifest_version"].as_u64() == Some(3) => ok.push(e.path().to_string_lossy().into_owned()),
@@ -337,6 +372,9 @@ pub struct Item {
     pub error: Option<String>,
     /// Made for Firefox (it has Firefox-specific settings).
     pub firefox: bool,
+    pub version: String,
+    /// Switched off in Settings (kept on disk, not loaded).
+    pub disabled: bool,
 }
 
 fn b64(data: &[u8]) -> String {
@@ -399,8 +437,10 @@ pub fn items() -> Vec<Item> {
                 popup: act["default_popup"].as_str().map(|s| s.trim_start_matches('/').to_string()),
                 options: m["options_page"].as_str().or_else(|| m["options_ui"]["page"].as_str()).map(|s| s.trim_start_matches('/').to_string()),
                 id: id_for_path(&e.path()),
-                error: (m["manifest_version"].as_u64() != Some(3)).then(|| "old Manifest V2 format: reinstall to convert".to_string()),
+                error: (m["manifest_version"].as_u64() != Some(3) && !e.path().join(DISABLED_MARK).exists()).then(|| "old Manifest V2 format: reinstall to convert".to_string()),
                 firefox: m.get("browser_specific_settings").is_some() || m.get("applications").is_some(),
+                version: m["version"].as_str().unwrap_or("").to_string(),
+                disabled: e.path().join(DISABLED_MARK).exists(),
                 dir,
             });
         }
@@ -445,5 +485,17 @@ mod convert_tests {
         assert_eq!(a.len(), 32);
         assert!(a.bytes().all(|c| (b'a'..=b'p').contains(&c)));
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::store_link;
+
+    #[test]
+    fn store_pages_become_installable_addresses() {
+        assert_eq!(store_link("https://chromewebstore.google.com/detail/ublock-origin/cjpalhdlnbpafiamejdnhcphjbkeiagm?hl=en").as_deref(), Some("cjpalhdlnbpafiamejdnhcphjbkeiagm"));
+        assert_eq!(store_link("https://addons.mozilla.org/en-US/firefox/addon/ublock-origin/").as_deref(), Some("https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"));
+        assert_eq!(store_link("https://example.com/addon/x"), None);
     }
 }

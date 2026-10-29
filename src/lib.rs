@@ -98,6 +98,8 @@ enum Ev {
     Zoom(String),
     /// A command from the history page: "del:<url>" or "clear".
     Hist(String),
+    /// The set of installed extensions changed (an install finished).
+    ExtChanged,
     Tick,
     /// A browser finished closing (safe to release anything it was using).
     Closed,
@@ -2044,7 +2046,7 @@ impl Shell {
             "save_history": self.cfg.save_history,
             "default_browser": {"is_default": defaultbrowser::is_default(), "check": self.cfg.default_check},
             "ai": {"open": w.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
-            "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some(), "error": e.error})).collect::<Vec<_>>(),
+            "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some(), "options": e.options.is_some(), "error": e.error, "id": e.id, "version": e.version, "firefox": e.firefox, "disabled": e.disabled})).collect::<Vec<_>>(),
             "control": {"enabled": self.cfg.control.enabled, "allow_js": self.cfg.control.allow_js},
             "ai_sites": config::AI_SITES.iter().map(|(id, n, _)| json!({"id": id, "name": n})).collect::<Vec<_>>(),
             "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
@@ -2265,7 +2267,8 @@ impl Shell {
             "ext_open" => {
                 let dir = m["dir"].as_str().unwrap_or("");
                 let Some(it) = self.ext_items.iter().find(|e| e.dir == dir).cloned() else { return false };
-                match (it.error, it.popup.or(it.options)) {
+                let page = if m["page"] == "options" { it.options.clone().or(it.popup.clone()) } else { it.popup.clone().or(it.options.clone()) };
+                match (it.error, page) {
                     (Some(e), _) => self.toast(&format!("{} is not loaded: {e}", it.name)),
                     (None, Some(page)) => {
                         let n = self.new_tab(&format!("chrome-extension://{}/{page}", it.id), false);
@@ -2273,6 +2276,48 @@ impl Shell {
                     }
                     (None, None) => self.toast("This extension has no popup or options page to open."),
                 }
+            }
+            "ext_enable" => {
+                let dir = m["dir"].as_str().unwrap_or("");
+                match ext::set_enabled(dir, m["on"].as_bool().unwrap_or(true)) {
+                    Ok(()) => {
+                        self.ext_items = ext::items();
+                        self.push();
+                    }
+                    Err(e) => self.toast(&e),
+                }
+            }
+            "ext_remove" => {
+                let dir = m["dir"].as_str().unwrap_or("");
+                match ext::remove(dir) {
+                    Ok(()) => {
+                        self.ext_items = ext::items();
+                        self.push();
+                        self.toast("Extension removed. Restart the browser to finish unloading it.");
+                    }
+                    Err(e) => self.toast(&e),
+                }
+            }
+            "ext_install" => {
+                let src = m["src"].as_str().unwrap_or("").trim().to_string();
+                if src.is_empty() {
+                    return false;
+                }
+                self.toast("Installing...");
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let msg = match ext::install(&src) {
+                        Ok(_) => "Installed. Restart the browser to load it.".to_string(),
+                        Err(e) => format!("Could not install: {e}"),
+                    };
+                    let _ = tx.send_event(Ev::Toast(msg));
+                    let _ = tx.send_event(Ev::ExtChanged);
+                });
+            }
+            "ext_store" => {
+                let url = if m["which"] == "firefox" { "https://addons.mozilla.org/firefox/extensions/" } else { "https://chromewebstore.google.com/category/extensions" };
+                let n = self.new_tab(url, false);
+                self.activate(n);
             }
             "ai_toggle" => {
                 if self.cfg.ai.enabled {
@@ -2948,6 +2993,10 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
                         t.url = new;
                     }
                     state.apply_zoom(id);
+                    state.push();
+                }
+                Ev::ExtChanged => {
+                    state.ext_items = ext::items();
                     state.push();
                 }
                 Ev::Hist(c) => {

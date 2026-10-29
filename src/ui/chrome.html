@@ -239,6 +239,7 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
     <button data-s="toolbar">Toolbar</button>
     <button data-s="ai">AI assistant</button>
     <button data-s="control">AI control</button>
+    <button data-s="extensions">Extensions</button>
     <button data-s="updates">Updates</button>
     <button data-s="gestures">Mouse gestures</button>
     <button class="close" id="close">Close</button>
@@ -282,6 +283,17 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
       <label class="row">Allow AI tools to control this browser<span class="switch"><input type="checkbox" id="ctl_on"><i></i></span></label>
       <label class="row">Also allow running JavaScript in pages<span class="switch"><input type="checkbox" id="ctl_js"><i></i></span></label>
       <p class="note">Lets a program on this PC (for example an AI agent such as Claude Code) run <code>imc-browse ctl ...</code> to open tabs, read page text, click, type, scroll and take screenshots. It only works for programs running as your Windows user, never remotely. Ghost tabs are invisible to it, there are no commands for passwords, cards or downloads, and every request is listed at <a href="#" id="ctl_log">imc://ai</a>. A green dot on the AI button shows while it is on. Turn on JavaScript only if you trust the tool: it can read anything on pages you are signed in to. Run <code>imc-browse ctl help</code> for the commands.</p>
+    </section>
+
+    <section id="s-extensions">
+      <h2>Extensions</h2>
+      <div id="ext_list"></div>
+      <p class="note" id="ext_restart" style="display:none">Changes apply after a restart. <button class="sec inl" id="ext_restart_btn"></button></p>
+      <h3>Get more</h3>
+      <div class="tools"><button class="act inl" id="ext_cws">Chrome Web Store</button><button class="act inl" id="ext_amo">Firefox Add-ons</button></div>
+      <label class="row">Install from an address or file<input type="text" id="ext_src" placeholder="Store page address, extension id, .crx / .xpi / .zip, or folder"></label>
+      <div class="tools"><button class="sec inl" id="ext_install">Install</button></div>
+      <p class="note">Open a store, find an extension, then paste its page address above. Chrome and Firefox extensions both work; older ones are converted to the current format, which works for most but not all. Installs, removals and switching off need a restart.</p>
     </section>
 
     <section id="s-updates">
@@ -688,6 +700,9 @@ $('p_hw').onchange=()=>{send({cmd:'hwaccel',enabled:$('p_hw').checked});$('hw_re
 $('hw_restart').onclick=()=>send({cmd:'restart'});
 $('up_check').innerHTML=gl('reload',14)+'<span>Check now</span>';
 $('h_on').onchange=()=>send({cmd:'history_prefs',on:$('h_on').checked});$('h_open').onclick=()=>send({cmd:'history_open'});$('h_clear').onclick=()=>send({cmd:'history_clear',range:$('h_range').value});
+$('ext_cws').onclick=()=>{panel(false);send({cmd:'ext_store',which:'chrome'})};$('ext_amo').onclick=()=>{panel(false);send({cmd:'ext_store',which:'firefox'})};
+$('ext_install').onclick=()=>{const v=$('ext_src').value.trim();if(v){send({cmd:'ext_install',src:v});$('ext_src').value='';$('ext_restart').style.display=''}};
+$('ext_restart_btn').innerHTML=gl('reload',14)+'<span>Restart now</span>';$('ext_restart_btn').onclick=()=>send({cmd:'restart'});
 $('p_restore').onchange=()=>send({cmd:'restore_prefs',on:$('p_restore').checked});
 $('def_set').onclick=()=>send({cmd:'default_set'});$('def_check').onchange=()=>send({cmd:'default_prefs',check:$('def_check').checked});
 $('up_check').onclick=()=>send({cmd:'update_check'});
@@ -727,6 +742,28 @@ function drawCreds(){
     el.append(d);
   }
   if(!list.length)el.textContent='No saved passwords.';
+}
+
+function drawExtensions(list){
+  const box=$('ext_list');if(!box)return;box.textContent='';
+  if(!list.length){const p=document.createElement('p');p.className='note';p.textContent='No extensions installed yet.';box.append(p);return}
+  for(const e of list){
+    const row=document.createElement('div');row.className='row';row.style.cssText='flex-wrap:wrap;gap:8px;align-items:center'+(e.disabled?';opacity:.6':'');
+    const ic=document.createElement('span');ic.style.cssText='width:24px;height:24px;display:inline-flex';ic.innerHTML=e.icon?'<img alt="" style="width:24px;height:24px" src="'+e.icon+'">':gl('extension',20);
+    const t=document.createElement('span');t.style.flex='1 1 200px';
+    const b=document.createElement('b');b.textContent=e.name;t.append(b);
+    const sub=document.createElement('div');sub.style.cssText='font-size:12px;color:var(--dim)';
+    sub.textContent=(e.firefox?'Firefox':'Chrome')+(e.version?' · v'+e.version:'')+(e.disabled?' · Off':e.error?' · Not loaded: '+e.error:' · On');t.append(sub);
+    row.append(ic,t);
+    const sw=document.createElement('label');sw.className='switch';sw.title=e.disabled?'Turn on':'Turn off';
+    const cb=document.createElement('input');cb.type='checkbox';cb.checked=!e.disabled;
+    cb.onchange=()=>{send({cmd:'ext_enable',dir:e.dir,on:cb.checked});$('ext_restart').style.display=''};
+    sw.append(cb,document.createElement('i'));row.append(sw);
+    if(e.options&&!e.disabled&&!e.error){const o=document.createElement('button');o.className='sec inl';o.textContent='Options';o.onclick=()=>{panel(false);send({cmd:'ext_open',dir:e.dir,page:'options'})};row.append(o)}
+    const r=document.createElement('button');r.className='sec inl';r.textContent='Remove';
+    r.onclick=()=>{if(r.dataset.sure){send({cmd:'ext_remove',dir:e.dir});$('ext_restart').style.display=''}else{r.dataset.sure=1;r.textContent='Click again to remove';setTimeout(()=>{delete r.dataset.sure;r.textContent='Remove'},4000)}};
+    row.append(r);box.append(row);
+  }
 }
 
 window.ui={
@@ -790,6 +827,7 @@ window.ui={
   const a=s.tabs.find(t=>t.id===s.active);
   document.body.classList.toggle('ghost',!!(a&&a.private));
   renderToolbar();
+  drawExtensions(s.extensions||[]);
   $('h_on').checked=s.save_history!==false;
   $('p_restore').checked=s.restore_tabs!==false;
   if(s.default_browser){$('def_state').textContent=s.default_browser.is_default?'IMC Browse is your default':'Not your default';$('def_set').style.display=s.default_browser.is_default?'none':'';$('def_check').checked=s.default_browser.check}
@@ -911,7 +949,7 @@ function section(n){
   if(n==='gestures')drawGestures();
   if(n==='updates')send({cmd:'update_state'});
 }
-const NAVG={control:'bot',ai:'ai',updates:'reload',general:'sliders',theme:'theme',bookmarks:'bookmarks',passwords:'key',cards:'lock',privacy:'shield',toolbar:'more',gestures:'grip'};
+const NAVG={extensions:'extension',control:'bot',ai:'ai',updates:'reload',general:'sliders',theme:'theme',bookmarks:'bookmarks',passwords:'key',cards:'lock',privacy:'shield',toolbar:'more',gestures:'grip'};
 for(const b of document.querySelectorAll('#nav button[data-s]')){const t=b.textContent;b.innerHTML=gl(NAVG[b.dataset.s]||'sliders',15)+'<span>'+t+'</span>';b.classList.add('inl');b.onclick=()=>section(b.dataset.s)}
 for(const[i,n]of[['back','back'],['fwd','forward'],['rel','reload'],['menu','menu'],['home','home'],['tbnew','plus'],['reopen','undo'],['print','print'],['full','fullscreen'],['zout','zoom-out'],['zin','zoom-in']])$(i).innerHTML=gl(n,18);
 $('dlbtn').innerHTML='<span class="ring"></span>'+gl('download',18);
