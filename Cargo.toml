@@ -1,6 +1,6 @@
 [package]
 name = "imc-browse"
-version = "0.1.0"
+version = "2026.10.1"
 edition = "2024"
 description = "Lightweight, privacy-first Windows browser on Chromium (CEF)"
 publish = false

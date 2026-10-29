@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn newer_rules() {
         let m = |v: &str, seq| serde_json::from_slice::<Manifest>(&manifest_json("stable", v, "other", seq)).unwrap();
-        assert!(is_newer(&m("99.0.0", 0), false));
+        assert!(is_newer(&m("9999.0.0", 0), false));
         assert!(!is_newer(&m(VERSION, 0), false));
         assert!(!is_newer(&m("0.0.1", 0), false));
         // nightly: only a later build time counts

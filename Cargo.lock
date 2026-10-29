@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "imc-browse"
-version = "0.1.0"
+version = "2026.10.1"
 dependencies = [
  "cef",
  "ed25519-dalek",

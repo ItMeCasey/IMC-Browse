@@ -141,7 +141,7 @@
   const hideX = () => { if (document.documentElement) document.documentElement.style.overflowX = 'hidden'; };
   hideX(); document.addEventListener('DOMContentLoaded', hideX);
   const rep = () => {
-    try { rep2(); } catch (e) { console.debug('IMCPOPDBG:err ' + e); }
+    try { rep2(); } catch (e) {}
   };
   const rep2 = () => {
     const d = document.documentElement, b = document.body;
@@ -163,7 +163,6 @@
     }
     h = Math.max(h + extra, Math.ceil(bottom));
     const k = w + ',' + h;
-    if (location.search.indexOf('__imcdbg') >= 0 || window.__imcdbg || true) console.debug('IMCPOPDBG:' + JSON.stringify({ w, h, extra, bottom, dsh: d.scrollHeight, bsh: b && b.scrollHeight, ih: innerHeight, sy: scrollY }));
     if (k !== last) { last = k; console.debug('IMCPOPSIZE:' + k); }
   };
   window.__imcRep = rep; // the browser calls this a few times a second while the popup is open (timers in this page do not run reliably)

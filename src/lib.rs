@@ -215,12 +215,6 @@ wrap_display_handler! {
                             }
                             return 1;
                         }
-                        if let Some(d) = m.strip_prefix("IMCPOPDBG:") {
-                            if dev("IMC_DEBUG_POP").is_some() {
-                                eprintln!("POPDBG {d}");
-                            }
-                            return 1;
-                        }
                         if m == "IMCPOPCLOSE" {
                             let _ = self.tx.send_event(Ev::PopClose);
                             return 1;
@@ -1994,7 +1988,7 @@ impl Shell {
         let Some(tab) = self.tabs.iter().find(|t| t.id == self.w.active) else { return };
         let c = passwords::load();
         let Some(cred) = c.get(i) else { return };
-        let same = adblock::registrable(&passwords::host(&cred.url)) == adblock::registrable(&passwords::host(&tab.url));
+        let same = passwords::same_site(&cred.url, &tab.url);
         if !tab.url.starts_with("https://") || !same {
             self.toast("Not filled: the open page is not an HTTPS page on this login's site.");
             return;

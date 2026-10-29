@@ -82,8 +82,22 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
+/// The host of an address, parsed the way the browser does: anything before an `@` is a login name, not the
+/// host (`https://bank.com:x@evil.example/` is evil.example), and a trailing port or dot is dropped.
 pub fn host(url: &str) -> String {
-    url.split("://").nth(1).unwrap_or(url).split(['/', '?', '#', ':']).next().unwrap_or("").to_ascii_lowercase()
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let auth = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    let auth = auth.rsplit('@').next().unwrap_or("");
+    let host = if let Some(v6) = auth.strip_prefix('[') { v6.split(']').next().unwrap_or("") } else { auth.split(':').next().unwrap_or("") };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Passwords are only offered to exactly the site they were saved for (a leading `www.` aside). Sharing a
+/// registrable domain is not enough: `alice.github.io` and `evil.github.io` are different owners.
+pub fn same_site(a: &str, b: &str) -> bool {
+    let (a, b) = (host(a), host(b));
+    let strip = |h: &str| h.strip_prefix("www.").unwrap_or(h).to_string();
+    !a.is_empty() && strip(&a) == strip(&b)
 }
 
 /// RFC 4180 CSV (quoted fields, doubled quotes, embedded newlines).
@@ -165,5 +179,21 @@ mod tests {
         let (n, _) = import_csv(&mut v, "name,url,username,password\nA,https://a.com/login,me,pw1\nA,https://a.com/x,me,pw2\n").unwrap();
         assert_eq!((n, v.len()), (2, 1));
         assert_eq!(decrypt(&v[0].enc).unwrap(), "pw2");
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn hosts_are_parsed_like_the_browser_and_matched_exactly() {
+        assert_eq!(host("https://bank.com:x@evil.example/login"), "evil.example");
+        assert_eq!(host("https://Example.COM:8443/a?b#c"), "example.com");
+        assert_eq!(host("https://[::1]:3000/"), "::1");
+        assert!(same_site("https://www.example.com/login", "https://example.com/"));
+        assert!(!same_site("https://alice.github.io/", "https://evil.github.io/"));
+        assert!(!same_site("https://bank.com/", "https://bank.com.evil.example/"));
+        assert!(!same_site("https://bank.com:x@evil.example/", "https://bank.com/"));
     }
 }
