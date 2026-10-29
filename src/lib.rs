@@ -58,10 +58,12 @@ const UI_ID: usize = 0;
 /// Extra windows get their own chrome UI browser with an id from this range.
 const UI_BASE: usize = usize::MAX / 2;
 fn is_ui(id: usize) -> bool {
-    id == UI_ID || (UI_BASE..usize::MAX - 1).contains(&id)
+    id == UI_ID || (UI_BASE..usize::MAX - 8).contains(&id)
 }
 /// The AI side panel's browser (not a tab).
 const AI_ID: usize = usize::MAX - 1;
+/// An extension's popup (its toolbar button's panel); at most one at a time.
+const POP_ID: usize = usize::MAX - 2;
 const AI_HEAD_H: f64 = 40.0;
 const AI_GAP: f64 = 6.0;
 
@@ -100,8 +102,12 @@ enum Ev {
     Hist(String),
     /// The set of installed extensions changed (an install finished).
     ExtChanged,
+    /// The open extension popup reported the size of its content (CSS pixels).
+    PopSize(i32, i32),
+    /// The popup asked to be closed (Escape).
+    PopClose,
     /// A store page asked to install the extension it is showing (its address).
-    ExtInstall(String),
+    ExtInstall(usize),
     Tick,
     /// A browser finished closing (safe to release anything it was using).
     Closed,
@@ -196,11 +202,27 @@ wrap_display_handler! {
         fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, src: Option<&CefString>, _line: i32) -> i32 {
             if !is_ui(self.id) {
                 if let Some(m) = msg.map(|m| m.to_string()) {
-                    if let Some(u) = m.strip_prefix("IMCEXT:") {
-                        // Only the stores' own pages may ask for an install.
-                        if src.map(|s| s.to_string()).is_some_and(|s| s.starts_with("https://chromewebstore.google.com/") || s.starts_with("https://addons.mozilla.org/")) {
-                            let _ = self.tx.send_event(Ev::ExtInstall(u.to_string()));
+                    if self.id == POP_ID {
+                        if let Some(sz) = m.strip_prefix("IMCPOPSIZE:") {
+                            if let Some((w, h)) = sz.split_once(',').and_then(|(w, h)| Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?))) {
+                                let _ = self.tx.send_event(Ev::PopSize(w, h));
+                            }
+                            return 1;
                         }
+                        if let Some(d) = m.strip_prefix("IMCPOPDBG:") {
+                            if std::env::var_os("IMC_DEBUG_POP").is_some() {
+                                eprintln!("POPDBG {d}");
+                            }
+                            return 1;
+                        }
+                        if m == "IMCPOPCLOSE" {
+                            let _ = self.tx.send_event(Ev::PopClose);
+                            return 1;
+                        }
+                    }
+                    if m.starts_with("IMCEXT:") {
+                        // The loop checks that this tab really is on a store page before installing anything.
+                        let _ = self.tx.send_event(Ev::ExtInstall(self.id));
                         return 1;
                     }
                     if let Some(c) = m.strip_prefix("IMCHIST:") {
@@ -756,6 +778,11 @@ wrap_app! {
             }
             cmd.append_switch_with_value(Some(&cs("disable-features")), Some(&cs("MediaRouter,Translate,OptimizationHints,AutofillServerCommunication")));
             cmd.append_switch_with_value(Some(&cs("enable-features")), Some(&cs("StrictOriginIsolation")));
+            if std::env::var_os("IMC_TEST_NOTHROTTLE").is_some() {
+                for s in ["disable-backgrounding-occluded-windows", "disable-renderer-backgrounding", "disable-background-timer-throttling"] {
+                    cmd.append_switch(Some(&cs(s)));
+                }
+            }
             if !self.hw {
                 cmd.append_switch(Some(&cs("disable-gpu")));
                 cmd.append_switch(Some(&cs("disable-gpu-compositing")));
@@ -823,6 +850,11 @@ struct Shell {
     drag: Option<(usize, usize)>,
     /// The outline window shown while dragging (a native window handle).
     ghost: Option<isize>,
+    /// The extension popup that is open: (window id, left, top, right edge of its button in physical pixels, opened at).
+    pop: Option<(usize, i32, i32, i32, Instant)>,
+    /// Its current rectangle in physical pixels (x, y, w, h).
+    pop_rect: Option<(i32, i32, i32, i32)>,
+    pop_polled: Instant,
     /// The window that currently shows the AI panel.
     ai_owner: usize,
     tx: EventLoopProxy<Ev>,
@@ -1248,7 +1280,7 @@ impl Shell {
     }
 
     fn spawn(&mut self, id: usize, url: &str, private: bool) -> bool {
-        let r = self.content_rect();
+        let r = if id == POP_ID { Rect { x: 0, y: 0, width: 30, height: 30 } } else { self.content_rect() };
         let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(sys::HWND(self.w.window.hwnd() as *mut _), &r);
         let mut client = Cl::new(id, self.tx.clone(), Some(self.shield.clone()), private, self.dl_ids.clone());
         let mut ctx = if private {
@@ -1359,9 +1391,117 @@ impl Shell {
             let show = t.id == self.w.active && !self.w.panel;
             place(t.id, r.x, r.y, page_w, r.height, show);
         }
+        if let (Some((win, ..)), Some((x, y, w, h))) = (self.pop, self.pop_rect) {
+            if win == self.w.id {
+                place(POP_ID, x, y, w, h, true);
+            }
+        }
         let head = (AI_HEAD_H * k) as i32;
         if ai_on || self.ai_owner == self.w.id {
             place(AI_ID, r.x + r.width - pw, r.y + head, pw, (r.height - head).max(0), ai_on);
+        }
+    }
+
+    /// A newly installed extension gets a toolbar button (once; remove it from the bar and it stays removed).
+    fn pin_new_extensions(&mut self) {
+        let mut changed = false;
+        for it in &self.ext_items {
+            if !self.cfg.known_extensions.contains(&it.dir) {
+                self.cfg.known_extensions.push(it.dir.clone());
+                let id = format!("ext:{}", it.dir);
+                if !self.cfg.toolbar.left.contains(&id) && !self.cfg.toolbar.right.contains(&id) {
+                    self.cfg.toolbar.right.insert(0, id);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.cfg.save();
+        }
+    }
+
+    fn close_popup(&mut self) {
+        self.pop = None;
+        self.pop_rect = None;
+        if let Some(b) = BROWSERS.with(|m| m.borrow_mut().remove(&POP_ID)) {
+            if let Some(h) = b.host() {
+                h.close_browser(1);
+            }
+        }
+    }
+
+    /// Opens an extension's popup under its toolbar button (coordinates in CSS pixels of the window).
+    fn open_popup(&mut self, it: &ext::Item, page: &str, left: f64, bottom: f64, right: f64) {
+        self.close_popup();
+        let k = self.w.window.scale_factor();
+        // The engine's tabs API does not know our tabs, so the popup is told which page it was opened on
+        // (its address, title and icon) and answers tabs.query with that. Ghost tabs are never described.
+        let tab = self.tabs.iter().find(|t| t.id == self.w.active && !t.private);
+        let info = json!({"id": tab.map(|t| t.id as i64).unwrap_or(-1), "url": tab.map(|t| t.url.clone()).unwrap_or_default(), "title": tab.map(|t| t.title.clone()).unwrap_or_default(), "fav": tab.and_then(|t| t.favicon.clone()).unwrap_or_default()});
+        let enc: String = info.to_string().bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+        let sep = if page.contains('?') { '&' } else { '?' };
+        let (path, frag) = page.split_once('#').map(|(p, f)| (p.to_string(), format!("#{f}"))).unwrap_or((page.to_string(), String::new()));
+        let url = format!("chrome-extension://{}/{path}{sep}__imc={enc}{frag}", it.id);
+        if !self.spawn(POP_ID, &url, false) {
+            return;
+        }
+        // start tiny and hidden; the page reports its real size and the panel grows to it
+        let (bx, by, br) = ((left * k) as i32, (bottom * k) as i32, (right * k) as i32);
+        self.pop = Some((self.w.id, bx, by, br, Instant::now()));
+        self.pop_rect = Some((br - 30, by + (4.0 * k) as i32, 30, 30));
+        place(POP_ID, br - 30, by + (4.0 * k) as i32, 30, 30, true);
+    }
+
+    fn pop_resize(&mut self, w: i32, h: i32) {
+        if std::env::var_os("IMC_SELFTEST").is_some() || std::env::var_os("IMC_DEBUG_POP").is_some() {
+            eprintln!("POPSIZE {w}x{h}");
+        }
+        let Some((win, _l, top, right, _)) = self.pop else { return };
+        let Some(wd) = self.all_wins().find(|x| x.id == win) else { return };
+        let k = wd.window.scale_factor();
+        let size = wd.window.inner_size();
+        let pw = ((w.clamp(40, 800) as f64) * k) as i32;
+        // a little extra: scrollHeight leaves out the last element's bottom margin, which would cause scrollbars
+        let ph = (((h + 12).clamp(40, 600) as f64) * k) as i32;
+        let x = (right - pw).clamp(4, (size.width as i32 - pw - 4).max(4));
+        let y = top + (4.0 * k) as i32;
+        let ph = ph.min((size.height as i32 - y - 4).max(60));
+        self.pop_rect = Some((x, y, pw, ph));
+        place(POP_ID, x, y, pw, ph, true);
+        if let Some(h) = BROWSERS.with(|m| m.borrow().get(&POP_ID).and_then(|b| b.host())) {
+            h.set_focus(1);
+        }
+    }
+
+    /// Closes the popup when focus goes anywhere else, like a menu.
+    fn poll_popup(&mut self) {
+        let Some((_, _, _, _, opened)) = self.pop else { return };
+        if self.pop_polled.elapsed() > Duration::from_millis(300) {
+            self.pop_polled = Instant::now();
+            BROWSERS.with(|m| {
+                if let Some(f) = m.borrow().get(&POP_ID).and_then(|b| b.main_frame()) {
+                    f.execute_java_script(Some(&cs("window.__imcRep&&window.__imcRep()")), Some(&cs("imc://popup")), 0);
+                }
+            });
+        }
+        let Some(hw) = host_hwnd(POP_ID) else {
+            self.close_popup();
+            return;
+        };
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{IsChild, IsWindow};
+        unsafe {
+            if !IsWindow(Some(hw)).as_bool() {
+                self.close_popup();
+                return;
+            }
+            if opened.elapsed() < Duration::from_millis(900) {
+                return;
+            }
+            let f = GetFocus();
+            if f.0.is_null() || !(f == hw || IsChild(hw, f).as_bool()) {
+                self.close_popup();
+            }
         }
     }
 
@@ -1433,7 +1573,7 @@ impl Shell {
             self.w.active = id;
             BROWSERS.with(|m| {
                 for (bid, b) in m.borrow().iter() {
-                    if !is_ui(*bid) && *bid != AI_ID {
+                    if !is_ui(*bid) && *bid != AI_ID && *bid != POP_ID {
                         if let Some(h) = b.host() {
                             h.was_hidden((*bid != id && !self.shown(*bid)) as i32);
                         }
@@ -2277,8 +2417,13 @@ impl Shell {
                 let dir = m["dir"].as_str().unwrap_or("");
                 let Some(it) = self.ext_items.iter().find(|e| e.dir == dir).cloned() else { return false };
                 let page = if m["page"] == "options" { it.options.clone().or(it.popup.clone()) } else { it.popup.clone().or(it.options.clone()) };
-                match (it.error, page) {
+                let anchored = m["x"].is_number();
+                match (it.error.clone(), page) {
                     (Some(e), _) => self.toast(&format!("{} is not loaded: {e}", it.name)),
+                    (None, Some(page)) if anchored => {
+                        let (l, b, r) = (m["x"].as_f64().unwrap_or(0.0), m["y"].as_f64().unwrap_or(0.0), m["r"].as_f64().unwrap_or(0.0));
+                        self.open_popup(&it, &page, l, b, r);
+                    }
                     (None, Some(page)) => {
                         let n = self.new_tab(&format!("chrome-extension://{}/{page}", it.id), false);
                         self.activate(n);
@@ -2831,6 +2976,9 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
         want_close: None,
         drag: None,
         ghost: None,
+        pop: None,
+        pop_rect: None,
+        pop_polled: Instant::now(),
         ai_owner: 0,
         tx: tx.clone(),
         tabs: vec![],
@@ -2871,6 +3019,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
         ids.push(state.new_tab(u, false));
     }
     let first = ids[active.min(ids.len() - 1)];
+    state.pin_new_extensions();
     state.sync_internal();
     {
         let tx_ctl = tx.clone();
@@ -2900,6 +3049,19 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
             step(16000, r#"{"cmd":"switch","id":1}"#);
             step(4000, r#"{"cmd":"close","id":3}"#);
             step(7000, r#"{"cmd":"close","id":2}"#);
+        });
+    }
+
+    // Dev hook: run UI commands from a file (one JSON object per line, with an optional "delay" in ms),
+    // so the browser can be exercised without touching the screen.
+    if let Some(path) = std::env::var_os("IMC_SELFTEST_IPC") {
+        let t = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                std::thread::sleep(Duration::from_millis(v["delay"].as_u64().unwrap_or(500)));
+                let _ = t.send_event(Ev::Ipc(v.to_string()));
+            }
         });
     }
 
@@ -3004,9 +3166,18 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
                     state.apply_zoom(id);
                     state.push();
                 }
-                Ev::ExtInstall(url) => state.ipc(&json!({"cmd": "ext_install", "src": url}).to_string()).then_some(()).unwrap_or(()),
+                Ev::ExtInstall(tab) => {
+                    // Only a tab that is on an extension store's own page may install, and what gets installed is that page.
+                    let url = state.tabs.iter().find(|t| t.id == tab).map(|t| t.url.clone()).unwrap_or_default();
+                    if url.starts_with("https://chromewebstore.google.com/") || url.starts_with("https://addons.mozilla.org/") {
+                        state.ipc(&json!({"cmd": "ext_install", "src": url}).to_string());
+                    }
+                }
+                Ev::PopSize(w, h) => state.pop_resize(w, h),
+                Ev::PopClose => state.close_popup(),
                 Ev::ExtChanged => {
                     state.ext_items = ext::items();
+                    state.pin_new_extensions();
                     state.push();
                 }
                 Ev::Hist(c) => {
@@ -3111,6 +3282,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
             _ => {}
         }
         state.poll_drag();
+        state.poll_popup();
         if let Some((tab, x, y, w, h)) = state.want_window.take() {
             let window = build_window(target, Some((x, y)), Some((w, h)));
             let id = state.next_win;

@@ -99,24 +99,128 @@
   }, true);
 })();
 
+// Extension popups: the engine's tabs API does not know this browser's tabs (tabs.query never answers), so
+// a popup opened from the toolbar is given the page it was opened on and answers tabs.query with it.
+(() => {
+  if (location.protocol !== 'chrome-extension:' || window.top !== window) return;
+  const m = /[?&]__imc=([^&#]+)/.exec(location.search);
+  if (!m) return;
+  let t;
+  try { t = JSON.parse(decodeURIComponent(m[1])); } catch (e) { return; }
+  const tab = { id: t.id, index: 0, windowId: 1, active: true, highlighted: true, pinned: false, incognito: false, selected: true,
+    url: t.url, title: t.title, favIconUrl: t.fav || '', status: 'complete', discarded: false, autoDiscardable: true, groupId: -1, width: 1280, height: 800 };
+  const win = { id: 1, focused: true, incognito: false, type: 'normal', state: 'normal', alwaysOnTop: false, left: 0, top: 0, width: 1280, height: 800, tabs: [tab] };
+  const reply = (v) => (cb) => { if (typeof cb === 'function') { setTimeout(() => cb(v), 0); return undefined; } return Promise.resolve(v); };
+  const set = (o, k, f) => { try { o[k] = f; } catch (e) { try { Object.defineProperty(o, k, { value: f, configurable: true, writable: true }); } catch (e2) {} } };
+  // the engine adds chrome.* after this script first runs, so keep trying until it is there
+  let done = false;
+  const install = () => {
+    const c = window.chrome;
+    if (done || !c || !c.tabs) return;
+    done = true;
+    set(c.tabs, 'query', (info, cb) => (typeof info === 'function' ? reply([tab])(info) : reply([tab])(cb)));
+    set(c.tabs, 'get', (id, cb) => reply(tab)(cb));
+    set(c.tabs, 'getCurrent', (cb) => reply(undefined)(cb));
+    if (c.windows) {
+      set(c.windows, 'getCurrent', (a, b) => reply(win)(typeof a === 'function' ? a : b));
+      set(c.windows, 'getLastFocused', (a, b) => reply(win)(typeof a === 'function' ? a : b));
+    }
+  };
+  install();
+  if (!done) {
+    const id = setInterval(() => { install(); if (done) clearInterval(id); }, 2);
+    setTimeout(() => clearInterval(id), 4000);
+    document.addEventListener('readystatechange', install);
+  }
+})();
+
+// Extension popups: report the size of the content so the panel can fit it, and close on Escape.
+(() => {
+  if (location.protocol !== 'chrome-extension:' || window.top !== window) return;
+  let last = '';
+  const hideX = () => { if (document.documentElement) document.documentElement.style.overflowX = 'hidden'; };
+  hideX(); document.addEventListener('DOMContentLoaded', hideX);
+  const rep = () => {
+    try { rep2(); } catch (e) { console.debug('IMCPOPDBG:err ' + e); }
+  };
+  const rep2 = () => {
+    const d = document.documentElement, b = document.body;
+    const w = Math.ceil(Math.max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0));
+    let h = Math.ceil(Math.max(d ? d.scrollHeight : 0, b ? b.scrollHeight : 0));
+    // pages that scroll inside their own container (many popups do): count what is hidden in there too
+    let extra = 0, bottom = 0;
+    if (b) {
+      let n = 0;
+      for (const el of b.querySelectorAll('*')) {
+        if (++n > 3000) break;
+        const r = el.getBoundingClientRect();
+        if (r.height > 0 && r.bottom + scrollY > bottom) bottom = r.bottom + scrollY;
+        if (el.scrollHeight > el.clientHeight + 1 && el.clientHeight > 0) {
+          const o = getComputedStyle(el).overflowY;
+          if (o === 'auto' || o === 'scroll') extra = Math.max(extra, el.scrollHeight - el.clientHeight);
+        }
+      }
+    }
+    h = Math.max(h + extra, Math.ceil(bottom));
+    const k = w + ',' + h;
+    if (location.search.indexOf('__imcdbg') >= 0 || window.__imcdbg || true) console.debug('IMCPOPDBG:' + JSON.stringify({ w, h, extra, bottom, dsh: d.scrollHeight, bsh: b && b.scrollHeight, ih: innerHeight, sy: scrollY }));
+    if (k !== last) { last = k; console.debug('IMCPOPSIZE:' + k); }
+  };
+  window.__imcRep = rep; // the browser calls this a few times a second while the popup is open (timers in this page do not run reliably)
+  addEventListener('load', rep);
+  if (window.ResizeObserver) new ResizeObserver(rep).observe(document.documentElement);
+  setInterval(rep, 400);
+  addEventListener('keydown', (e) => { if (e.key === 'Escape') console.debug('IMCPOPCLOSE'); }, true);
+})();
+
 // Extension stores: their own "Add to Chrome / Firefox" buttons need the real Chrome or Firefox, so on a
-// store page we add our own button that asks the browser to install that extension.
+// store page we turn those buttons into "Add to IMC Browse", which asks the browser to install that extension.
 (() => {
   const h = location.hostname;
   if (window.top !== window || (h !== 'chromewebstore.google.com' && h !== 'addons.mozilla.org')) return;
   const isDetail = () => (h === 'chromewebstore.google.com' ? /\/detail\//.test(location.pathname) : /\/addon\//.test(location.pathname));
-  let btn = null;
-  const sync = () => {
-    if (!isDetail()) { if (btn) { btn.remove(); btn = null; } return; }
-    if (btn && btn.isConnected) return;
-    btn = document.createElement('button');
-    btn.textContent = 'Add to IMC Browse';
-    btn.style.cssText = 'position:fixed;top:76px;right:20px;z-index:2147483647;padding:10px 18px;border:0;border-radius:10px;background:#4da3ff;color:#06121f;font:600 14px system-ui,Segoe UI,sans-serif;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.35)';
-    btn.onclick = () => { console.debug('IMCEXT:' + location.href); btn.textContent = 'Installing...'; setTimeout(() => { if (btn) btn.textContent = 'Add to IMC Browse'; }, 4000); };
-    document.documentElement.appendChild(btn);
+  const WANT = /^(add to (chrome|firefox|brave|edge)|switch to chrome|download firefox and get the extension|get firefox)$/i;
+  const GONE = /^remove from chrome$/i;
+  let fallback = null;
+  const ask = (e) => {
+    e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
+    console.debug('IMCEXT:' + location.href);
+    const t = e.currentTarget; const old = t.dataset.imcText;
+    setLabel(t, 'Installing...');
+    setTimeout(() => setLabel(t, old || 'Add to IMC Browse'), 3500);
   };
-  setInterval(sync, 700);
-  sync();
+  const setLabel = (el, text) => {
+    // keep the button's own icons: change only the deepest text
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let n, last = null;
+    while ((n = w.nextNode())) if (n.nodeValue.trim()) last = n;
+    if (last) last.nodeValue = text; else el.textContent = text;
+  };
+  const scan = () => {
+    if (!isDetail()) { if (fallback) { fallback.remove(); fallback = null; } return; }
+    let found = false;
+    for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+      const txt = (el.innerText || '').trim().replace(/\s+/g, ' ');
+      if (el.dataset.imc) { found = true; continue; }
+      if (GONE.test(txt)) { el.style.display = 'none'; continue; }
+      if (!WANT.test(txt)) continue;
+      el.dataset.imc = '1'; el.dataset.imcText = 'Add to IMC Browse';
+      el.removeAttribute('href'); el.removeAttribute('download');
+      setLabel(el, 'Add to IMC Browse');
+      el.addEventListener('click', ask, true);
+      found = true;
+    }
+    // the store changed its markup: still offer a button
+    if (!found && !fallback && document.readyState === 'complete' && performance.now() > 6000) {
+      fallback = document.createElement('button');
+      fallback.textContent = 'Add to IMC Browse';
+      fallback.style.cssText = 'position:fixed;top:76px;right:20px;z-index:2147483647;padding:10px 18px;border:0;border-radius:10px;background:#4da3ff;color:#06121f;font:600 14px system-ui,Segoe UI,sans-serif;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.35)';
+      fallback.onclick = () => { console.debug('IMCEXT:' + location.href); };
+      document.documentElement.appendChild(fallback);
+    } else if (found && fallback) { fallback.remove(); fallback = null; }
+  };
+  setInterval(scan, 500);
+  scan();
 })();
 
 // Link hover bubble (bottom-left, full URL). WebView2 draws its own status bubble, so this only

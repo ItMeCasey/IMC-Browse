@@ -90,7 +90,9 @@ pub fn remove(name: &str) -> Result<(), String> {
 fn download(url: &str) -> Result<Vec<u8>, String> {
     // curl.exe ships with Windows 10 1803+; avoids linking a TLS stack just for installs.
     let tmp = std::env::temp_dir().join(format!("imc-dl-{}.bin", std::process::id()));
+    use std::os::windows::process::CommandExt;
     let st = Command::new("curl.exe")
+        .creation_flags(0x0800_0000) // no console window
         .args(["-fsSL", "--max-filesize", "104857600", "-o"])
         .arg(&tmp)
         .arg(url)
@@ -210,9 +212,46 @@ pub fn convert_to_mv3(dir: &Path, m: &mut Value) -> Vec<String> {
                 m["background"] = json!({"service_worker": "imc-bg.js"});
                 w.push("background scripts now run as a service worker (no page or DOM); add-ons that need a persistent page may not work".into());
             }
-        } else if bg.contains_key("page") {
-            m.as_object_mut().map(|o| o.remove("background"));
-            w.push("background page is not supported and was removed".into());
+        } else if let Some(page) = bg.get("page").and_then(Value::as_str) {
+            // a background page becomes a service worker that loads the same scripts, in order
+            let page = page.trim_start_matches('/');
+            let base = Path::new(page).parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            let html = fs::read_to_string(dir.join(page)).unwrap_or_default();
+            let mut list: Vec<String> = vec![];
+            let lower = html.to_ascii_lowercase();
+            let mut at = 0;
+            while let Some(i) = lower[at..].find("<script") {
+                let start = at + i;
+                let end = lower[start..].find('>').map(|e| start + e).unwrap_or(lower.len());
+                let tag = &html[start..end];
+                let tl = tag.to_ascii_lowercase();
+                if let Some(k) = tl.find("src=") {
+                    let rest = &tag[k + 4..];
+                    let q = rest.chars().next().filter(|c| *c == '"' || *c == '\'');
+                    let src = match q {
+                        Some(q) => rest[1..].split(q).next().unwrap_or(""),
+                        None => rest.split(|c: char| c.is_whitespace() || c == '>').next().unwrap_or(""),
+                    };
+                    if !src.is_empty() && !src.contains("://") {
+                        let full = if src.starts_with('/') || base.is_empty() { src.trim_start_matches('/').to_string() } else { format!("{base}/{src}") };
+                        list.push(format!("{full:?}"));
+                    }
+                }
+                at = end.max(start + 1);
+            }
+            if list.is_empty() {
+                m.as_object_mut().map(|o| o.remove("background"));
+                w.push("background page has no scripts to carry over and was removed".into());
+            } else {
+                let js = format!("// generated: runs the old background page's scripts in a Manifest V3 service worker
+globalThis.browser = globalThis.chrome;
+importScripts({});
+", list.join(", "));
+                if fs::write(dir.join("imc-bg.js"), js).is_ok() {
+                    m["background"] = json!({"service_worker": "imc-bg.js"});
+                    w.push("background page now runs as a service worker (no DOM); add-ons that need a page may not work".into());
+                }
+            }
         }
     }
     w
@@ -284,6 +323,40 @@ fn finish(dir: &Path) -> Result<String, String> {
 
 /// The id Chromium gives an unpacked extension: SHA-256 of the folder path (as UTF-16), first 16
 /// bytes, written with the letters a-p.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = vec![];
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b' ' | 13 | 10 => continue,
+            _ => return None,
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// The id Chromium gives an extension: unpacked ones from the folder path, but one whose manifest has a
+/// `key` (everything from the Chrome Web Store) from that key, so it keeps its store id.
+pub fn ext_id(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    if let Some(key) = read_manifest(dir).and_then(|m| m["key"].as_str().and_then(b64_decode)) {
+        return Sha256::digest(&key)[..16].iter().flat_map(|b| [b >> 4, b & 15]).map(|n| (b'a' + n) as char).collect();
+    }
+    id_for_path(dir)
+}
+
 pub fn id_for_path(dir: &Path) -> String {
     use sha2::{Digest, Sha256};
     let canon = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -436,7 +509,7 @@ pub fn items() -> Vec<Item> {
                 icon: icon_uri(&e.path(), &m),
                 popup: act["default_popup"].as_str().map(|s| s.trim_start_matches('/').to_string()),
                 options: m["options_page"].as_str().or_else(|| m["options_ui"]["page"].as_str()).map(|s| s.trim_start_matches('/').to_string()),
-                id: id_for_path(&e.path()),
+                id: ext_id(&e.path()),
                 error: (m["manifest_version"].as_u64() != Some(3) && !e.path().join(DISABLED_MARK).exists()).then(|| "old Manifest V2 format: reinstall to convert".to_string()),
                 firefox: m.get("browser_specific_settings").is_some() || m.get("applications").is_some(),
                 version: m["version"].as_str().unwrap_or("").to_string(),

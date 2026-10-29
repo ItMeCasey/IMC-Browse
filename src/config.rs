@@ -24,6 +24,8 @@ pub struct Config {
     pub save_history: bool,
     /// Items on either side of the address bar, by id (see the TB_DEFS table in chrome.html).
     pub toolbar: Toolbar,
+    /// Extensions already offered a toolbar button (so one you remove from the bar is not put back).
+    pub known_extensions: Vec<String>,
     pub gestures: Gestures,
     /// Remembered zoom factor per site (host), like Chrome. Ghost tabs never write here.
     pub zoom: HashMap<String, f64>,
@@ -321,6 +323,7 @@ impl Default for Config {
             restore_tabs: true,
             save_history: true,
             toolbar: Toolbar::default(),
+            known_extensions: vec![],
             gestures: Gestures::default(),
             zoom: HashMap::new(),
             update: UpdateCfg::default(),

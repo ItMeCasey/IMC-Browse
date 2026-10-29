@@ -558,7 +558,7 @@ function tbElement(id){
   if(!b){b=document.createElement('button');b.className='btn';extEls[id]=b}
   b.title=d.ext.name+' (extension)';
   b.innerHTML=d.ext.icon?'<img alt="" src="'+d.ext.icon+'">':gl('extension',18);
-  b.onclick=()=>send({cmd:'ext_open',dir:d.ext.dir});
+  b.onclick=()=>{const r=b.getBoundingClientRect();send({cmd:'ext_open',dir:d.ext.dir,x:r.left,y:r.bottom,r:r.right})};
   return b;
 }
 function renderToolbar(){
@@ -806,7 +806,7 @@ function drawExtensions(list){
     meta.append(st);body.append(meta);
     if(e.error&&!e.disabled)body.append(el('div','exterr',e.error));
     const acts=el('div','extacts');
-    if(e.options&&!e.disabled&&!e.error){const o=el('button','ghost');o.innerHTML=gl('sliders',15)+'<span>Options</span>';o.onclick=()=>{panel(false);send({cmd:'ext_open',dir:e.dir,page:'options'})};acts.append(o)}
+    if(e.options&&!e.disabled&&!e.error){const o=el('button','ghost');o.innerHTML=gl('sliders',15)+'<span>Options</span>';o.onclick=()=>{const r=o.getBoundingClientRect();send({cmd:'ext_open',dir:e.dir,page:'options',x:r.left,y:r.bottom,r:r.right})};acts.append(o)}
     const r=el('button','ghost danger');r.innerHTML=gl('trash',15)+'<span>Remove</span>';
     r.onclick=()=>{if(r.dataset.sure){send({cmd:'ext_remove',dir:e.dir});$('ext_restart').style.display=''}else{r.dataset.sure=1;r.classList.add('sure');r.querySelector('span').textContent='Sure?';setTimeout(()=>{delete r.dataset.sure;r.classList.remove('sure');const sp=r.querySelector('span');if(sp)sp.textContent='Remove'},3500)}};
     acts.append(r);
