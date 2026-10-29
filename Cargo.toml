@@ -5,6 +5,12 @@ edition = "2024"
 description = "Lightweight, privacy-first Windows browser on Chromium (CEF)"
 publish = false
 
+# The app is a DLL that CEF's bootstrap.exe (renamed imc-browse.exe) loads: that is what lets the
+# Chromium sandbox be turned on. See tools/stage-cef.ps1.
+[lib]
+name = "imc_browse"
+crate-type = ["cdylib"]
+
 [dependencies]
 cef = { version = "156.2", default-features = false, features = ["resources"] }
 serde = { version = "1", features = ["derive"] }

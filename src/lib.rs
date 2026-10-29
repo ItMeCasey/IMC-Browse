@@ -2622,14 +2622,21 @@ fn argv_first_is_ctl() -> bool {
     std::env::args().nth(1).as_deref() == Some("ctl")
 }
 
-fn main() {
+/// Entry point called by bootstrap.exe (which has already set up the sandbox for this process).
+#[unsafe(no_mangle)]
+pub extern "C" fn RunWinMain(_instance: *mut std::ffi::c_void, _cmd_line: *mut u16, _show: i32, sandbox_info: *mut std::ffi::c_void, _version: *mut std::ffi::c_void) -> i32 {
+    run(sandbox_info);
+    0
+}
+
+fn run(sandbox_info: *mut std::ffi::c_void) {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
 
     // Renderer/GPU/utility subprocesses are this same exe: they run here and return.
     let cfg = Config::load();
     let mut app = ImcApp::new(cfg.vpn.clone(), cfg.gestures.page_config(), cfg.hardware_acceleration);
-    let code = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
+    let code = execute_process(Some(args.as_main_args()), Some(&mut app), sandbox_info as *mut u8);
     if code >= 0 {
         std::process::exit(code);
     }
@@ -2655,8 +2662,8 @@ fn main() {
     config::write_secure_dns(&config::root().join("cef-profile"), &cfg.doh);
     vpn::start_watchdog(cfg.vpn.clone());
     let cache = cs(&config::root().join("cef-profile").to_string_lossy());
-    let settings = Settings { no_sandbox: 1, root_cache_path: cache.clone(), cache_path: cache, ..Default::default() };
-    assert_eq!(initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()), 1);
+    let settings = Settings { no_sandbox: 0, root_cache_path: cache.clone(), cache_path: cache, ..Default::default() };
+    assert_eq!(initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), sandbox_info as *mut u8), 1);
 
     let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
     let tx = event_loop.create_proxy();

@@ -182,6 +182,12 @@ fn side(exe: &Path, ext: &str) -> PathBuf {
     exe.with_file_name(n)
 }
 
+/// The app itself is a DLL next to the launcher exe (CEF's bootstrap), named like it: imc-browse.dll.
+/// That is the file updates replace; the launcher rarely changes.
+fn app_dll() -> Option<PathBuf> {
+    std::env::current_exe().ok().map(|e| e.with_extension("dll"))
+}
+
 /// Replaces `exe` with `new_bytes`. A running exe can be renamed but not overwritten, so the old
 /// one is moved aside (`.old`, removed on the next start) and the new one takes its name.
 fn swap_in(exe: &Path, new_bytes: &[u8]) -> Result<(), String> {
@@ -211,14 +217,14 @@ pub fn install(a: &Available) -> Result<String, String> {
     let url = a.urls.get(&asset.name).ok_or("download not found on the release")?;
     let bytes = curl(url, 180)?;
     check_download(&bytes, asset)?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = app_dll().ok_or("cannot find the app file")?;
     swap_in(&exe, &bytes)?;
     Ok(if a.manifest.channel == "nightly" { format!("{} (nightly {})", a.manifest.version, a.manifest.build) } else { a.manifest.version.clone() })
 }
 
 /// Removes files left by a previous update.
 pub fn cleanup() {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = app_dll() {
         let _ = fs::remove_file(side(&exe, ".old"));
         let _ = fs::remove_file(side(&exe, ".new"));
     }
