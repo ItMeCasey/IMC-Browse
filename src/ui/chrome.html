@@ -17,6 +17,8 @@ body.vert #tabs{top:calc(var(--title-h) + var(--bar-h));bottom:0;right:auto;widt
 .tab{display:flex;align-items:center;gap:6px;min-width:60px;max-width:220px;flex:1 1 180px;padding:0 6px 0 10px;background:var(--tab);border-radius:8px 8px 0 0;cursor:default}
 body.vert .tab{flex:0 0 34px;max-width:none;border-radius:8px}
 .tab.on{background:var(--tab-on)}
+.tab.drag{opacity:.75;position:relative;z-index:5;box-shadow:0 4px 14px #0006}
+.tab.tear{outline:2px dashed var(--acc);outline-offset:-2px}
 .tab.frozen .t{opacity:.55;font-style:italic}
 .zzz{flex:0 0 auto;display:inline-flex;align-items:center;gap:3px;white-space:nowrap;font-size:10px;font-weight:700;letter-spacing:.5px;padding:1px 5px;border-radius:8px;background:color-mix(in srgb,var(--acc),transparent 75%);color:var(--acc)}
 #title{display:none;position:absolute;left:0;right:138px;top:0;height:var(--title-h);align-items:center;padding:0 12px;color:var(--dim);font-weight:600;background:var(--bar)}
@@ -729,6 +731,7 @@ function drawCreds(){
 
 window.ui={
  set(s){
+  if(window._dragging){window._pend=s;return}
   S=s;T=T||Object.assign({},s.cfg.theme);
   if(!window._init){window._init=1;fillCfg(s.cfg);drawThemeOpts();applyTheme(T);drawSwatches()}
   document.body.classList.toggle('vert',s.cfg.vertical_tabs);
@@ -749,6 +752,37 @@ window.ui={
     x.onclick=e=>{e.stopPropagation();send({cmd:'close',id:t.id})};
     d.append(x);d.onclick=()=>send({cmd:'switch',id:t.id});
     d.onmousedown=e=>{if(e.button===1)e.preventDefault()};
+    d.addEventListener('pointerdown',e=>{
+      if(e.button!==0||e.target.closest('button'))return;
+      const vert=document.body.classList.contains('vert'),sx=e.clientX,sy=e.clientY;let on=false,out=false;
+      try{d.setPointerCapture(e.pointerId)}catch(_){}
+      const outside=ev=>{const r=el.getBoundingClientRect(),m=40;return ev.clientX<r.left-m||ev.clientX>r.right+m||ev.clientY<r.top-m||ev.clientY>r.bottom+m||ev.clientX<0||ev.clientY<0||ev.clientX>innerWidth||ev.clientY>innerHeight};
+      const mv=ev=>{
+        if(!on&&Math.hypot(ev.clientX-sx,ev.clientY-sy)>6){on=true;window._dragging=true;d.classList.add('drag');send({cmd:'tab_drag',id:t.id})}
+        if(!on)return;
+        out=outside(ev);d.classList.toggle('tear',out);
+        d.style.transform=out?'':(vert?'translateY('+(ev.clientY-sy)+'px)':'translateX('+(ev.clientX-sx)+'px)');
+        if(out)return;
+        const others=[...el.querySelectorAll('.tab')].filter(x=>x!==d);
+        for(const o of others){
+          const r=o.getBoundingClientRect(),mid=vert?(r.top+r.height/2):(r.left+r.width/2),pos=vert?ev.clientY:ev.clientX;
+          const before=o.compareDocumentPosition(d)&Node.DOCUMENT_POSITION_FOLLOWING;
+          if(before&&pos<mid){o.before(d);d.style.transform='';return}
+          if(!before&&pos>mid){o.after(d);d.style.transform='';return}
+        }
+      };
+      const up=ev=>{
+        d.removeEventListener('pointermove',mv);d.removeEventListener('pointerup',up);d.removeEventListener('pointercancel',up);
+        try{d.releasePointerCapture(e.pointerId)}catch(_){}
+        if(!on)return;
+        d.classList.remove('drag','tear');d.style.transform='';
+        const ids=[...el.querySelectorAll('.tab')].length;
+        if(!out)send({cmd:'tab_order',ids:[...document.querySelectorAll('#tabs .tab')].map(x=>+x.dataset.id)});
+        setTimeout(()=>{window._dragging=false;if(window._pend){const p=window._pend;window._pend=null;window.ui.set(p)}},60);
+      };
+      d.addEventListener('pointermove',mv);d.addEventListener('pointerup',up);d.addEventListener('pointercancel',up);
+    });
+    d.dataset.id=t.id;
     d.onauxclick=e=>{if(e.button===1){e.preventDefault();send({cmd:'close',id:t.id})}};el.append(d);
   }
   const p=document.createElement('button');p.className='btn';p.id='newtab';p.innerHTML=s.cfg.vertical_tabs?gl('plus',14)+'&nbsp; New tab':gl('plus',16);p.title='New tab';p.onclick=()=>send({cmd:'new'});el.append(p);
@@ -835,6 +869,7 @@ window.ui={
   if(!l.length)el.textContent='No saved cards.';
  },
  revealed(i,pw){const e=$('pwl'+i);if(e)e.textContent=e.textContent.split('  •  ')[0]+'  •  '+pw},
+ dragEnd(){window._dragging=false;if(window._pend){const p=window._pend;window._pend=null;window.ui.set(p)}},
  suggest(l){const d=$('sug');d.textContent='';for(const x of l){const o=document.createElement('option');o.value=x.url;o.label=x.title||x.url;d.append(o)}},
  toast(m,act){
   const t=$('toast');t.textContent=m;t.style.display='block';t.style.pointerEvents=act?'auto':'none';

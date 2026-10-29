@@ -55,6 +55,11 @@ const TABSTRIP_H: f64 = 36.0;
 const SIDEBAR_W: f64 = 230.0;
 const TITLEBAR_H: f64 = 32.0;
 const UI_ID: usize = 0;
+/// Extra windows get their own chrome UI browser with an id from this range.
+const UI_BASE: usize = usize::MAX / 2;
+fn is_ui(id: usize) -> bool {
+    id == UI_ID || (UI_BASE..usize::MAX - 1).contains(&id)
+}
 /// The AI side panel's browser (not a tab).
 const AI_ID: usize = usize::MAX - 1;
 const AI_HEAD_H: f64 = 40.0;
@@ -69,6 +74,8 @@ pub enum DlEvent {
 
 enum Ev {
     Ipc(String),
+    /// A command from the chrome UI of the window whose UI browser has this id.
+    IpcFrom(usize, String),
     Url(usize, String),
     Title(usize, String),
     Load(usize, bool),
@@ -157,14 +164,14 @@ wrap_display_handler! {
     }
     impl DisplayHandler {
         fn on_address_change(&self, _b: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
-            if self.id != UI_ID && frame.is_some_and(|f| f.is_main() != 0) {
+            if !is_ui(self.id) && frame.is_some_and(|f| f.is_main() != 0) {
                 if let Some(u) = url {
                     let _ = self.tx.send_event(Ev::Url(self.id, u.to_string()));
                 }
             }
         }
         fn on_favicon_urlchange(&self, _b: Option<&mut Browser>, urls: Option<&mut CefStringList>) {
-            if self.id == UI_ID {
+            if is_ui(self.id) {
                 return;
             }
             if let Some(first) = urls.cloned().and_then(|l| l.into_iter().next()) {
@@ -175,7 +182,7 @@ wrap_display_handler! {
             }
         }
         fn on_title_change(&self, _b: Option<&mut Browser>, title: Option<&CefString>) {
-            if self.id != UI_ID {
+            if !is_ui(self.id) {
                 if let Some(t) = title {
                     let _ = self.tx.send_event(Ev::Title(self.id, t.to_string()));
                 }
@@ -183,7 +190,7 @@ wrap_display_handler! {
         }
         // The chrome UI talks to Rust through console lines; only the UI's own client reads them.
         fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, src: Option<&CefString>, _line: i32) -> i32 {
-            if self.id != UI_ID {
+            if !is_ui(self.id) {
                 if let Some(m) = msg.map(|m| m.to_string()) {
                     if let Some(c) = m.strip_prefix("IMCHIST:") {
                         // Only our own history page may change the history, never a website.
@@ -221,10 +228,10 @@ wrap_display_handler! {
                     }
                 }
             }
-            if self.id == UI_ID {
+            if is_ui(self.id) {
                 if let Some(m) = msg.map(|m| m.to_string()) {
                     if let Some(body) = m.strip_prefix("IMCIPC:") {
-                        let _ = self.tx.send_event(Ev::Ipc(body.to_string()));
+                        let _ = self.tx.send_event(Ev::IpcFrom(self.id, body.to_string()));
                         return 1;
                     }
                 }
@@ -254,7 +261,7 @@ wrap_load_handler! {
             }
         }
         fn on_loading_state_change(&self, _b: Option<&mut Browser>, is_loading: i32, _back: i32, _fwd: i32) {
-            if self.id != UI_ID {
+            if !is_ui(self.id) {
                 let _ = self.tx.send_event(Ev::Load(self.id, is_loading != 0));
             }
         }
@@ -675,7 +682,7 @@ wrap_client! {
             self.shield.clone().map(|s| Req::new(s, self.tx.clone()))
         }
         fn download_handler(&self) -> Option<DownloadHandler> {
-            (self.id != UI_ID).then(|| Dl::new(self.tx.clone(), self.private, self.dl_ids.clone()))
+            (!is_ui(self.id)).then(|| Dl::new(self.tx.clone(), self.private, self.dl_ids.clone()))
         }
         fn permission_handler(&self) -> Option<PermissionHandler> {
             Some(Perm::new())
@@ -763,6 +770,8 @@ wrap_app! {
 
 struct Tab {
     id: usize,
+    /// The window (Win.id) this tab belongs to.
+    win: usize,
     url: String,
     title: String,
     loading: bool,
@@ -779,16 +788,37 @@ struct Tab {
     last_active: Instant,
 }
 
-struct Shell {
+/// One browser window: its OS window, its chrome UI browser, and what it is showing.
+struct Win {
+    id: usize,
     window: Window,
+    ui_id: usize,
+    active: usize,
+    panel: bool,
+    ai_open: bool,
+    ui_ready: bool,
+}
+
+struct Shell {
+    /// The window events are currently being handled for; the others are in `wins`.
+    w: Win,
+    wins: Vec<Win>,
+    next_win: usize,
+    ui_url: String,
+    /// Window to create once the event loop is reachable: (tab to put in it, x, y, width, height) in screen pixels.
+    want_window: Option<(usize, i32, i32, u32, u32)>,
+    want_close: Option<usize>,
+    /// A tab is being dragged: (tab id, the window it started in). The release is noticed by polling the mouse button.
+    drag: Option<(usize, usize)>,
+    /// The outline window shown while dragging (a native window handle).
+    ghost: Option<isize>,
+    /// The window that currently shows the AI panel.
+    ai_owner: usize,
     tx: EventLoopProxy<Ev>,
     tabs: Vec<Tab>,
-    active: usize,
     next: usize,
     cfg: Config,
-    panel: bool,
     bookmarks: Vec<bookmarks::Bookmark>,
-    ui_ready: bool,
     shield: Arc<Shield>,
     /// In-memory profile shared by all Ghost tabs; dropped (and the data with it) when the last one closes.
     ghost_ctx: Option<RequestContext>,
@@ -818,7 +848,7 @@ fn place(id: usize, x: i32, y: i32, w: i32, h: i32, show: bool) {
     if let Some(hwnd) = host_hwnd(id) {
         let flag = if show { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
         unsafe {
-            let _ = SetWindowPos(hwnd, if show && id != UI_ID { Some(HWND_TOP) } else { None }, x, y, w.max(0), h.max(0), SWP_NOACTIVATE | flag | if show && id != UI_ID { Default::default() } else { SWP_NOZORDER });
+            let _ = SetWindowPos(hwnd, if show && !is_ui(id) { Some(HWND_TOP) } else { None }, x, y, w.max(0), h.max(0), SWP_NOACTIVATE | flag | if show && !is_ui(id) { Default::default() } else { SWP_NOZORDER });
         }
     }
 }
@@ -852,10 +882,291 @@ fn normalize(t: &str, engine: &str) -> String {
     format!("{}{q}", search_base(engine))
 }
 
+fn reparent(id: usize, parent: isize) {
+    if let Some(h) = host_hwnd(id) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetParent(h, Some(HWND(parent as *mut _)));
+        }
+    }
+}
+
+fn build_window(target: &tao::event_loop::EventLoopWindowTarget<Ev>, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) -> Window {
+    let mut b = WindowBuilder::new().with_title("IMC Browse (CEF)").with_decorations(false);
+    b = match size {
+        Some((w, h)) => b.with_inner_size(tao::dpi::PhysicalSize::new(w, h)),
+        None => b.with_inner_size(LogicalSize::new(1280.0, 800.0)),
+    };
+    if let Some((x, y)) = pos {
+        b = b.with_position(tao::dpi::PhysicalPosition::new(x, y));
+    }
+    b.build(target).expect("window")
+}
+
+/// Creates the chrome UI browser filling `window`.
+fn create_ui(window: &Window, ui_id: usize, ui_url: &str, tx: &EventLoopProxy<Ev>) {
+    let size = window.inner_size();
+    let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(
+        sys::HWND(window.hwnd() as *mut _),
+        &Rect { x: 0, y: 0, width: size.width as i32, height: size.height as i32 },
+    );
+    let mut ui_client = Cl::new(ui_id, tx.clone(), None, false, Arc::new(AtomicU64::new(0)));
+    let ui = browser_host_create_browser_sync(Some(&info), Some(&mut ui_client), Some(&cs(ui_url)), Some(&BrowserSettings::default()), None, None).expect("chrome ui");
+    BROWSERS.with(|m| m.borrow_mut().insert(ui_id, ui));
+}
+
 impl Shell {
+    fn all_wins(&self) -> impl Iterator<Item = &Win> {
+        std::iter::once(&self.w).chain(self.wins.iter())
+    }
+
+    /// Makes `id` the current window (swaps it with the one that was current).
+    fn focus_win(&mut self, id: usize) {
+        if self.w.id == id {
+            return;
+        }
+        if let Some(i) = self.wins.iter().position(|w| w.id == id) {
+            std::mem::swap(&mut self.w, &mut self.wins[i]);
+        }
+    }
+
+    fn win_of_window(&self, id: tao::window::WindowId) -> Option<usize> {
+        self.all_wins().find(|w| w.window.id() == id).map(|w| w.id)
+    }
+
+    fn win_of_ui(&self, ui_id: usize) -> Option<usize> {
+        self.all_wins().find(|w| w.ui_id == ui_id).map(|w| w.id)
+    }
+
+    /// True when `tab` is the visible tab of some window (those are never hibernated or hidden).
+    fn shown(&self, tab: usize) -> bool {
+        self.all_wins().any(|w| w.active == tab)
+    }
+
+    fn win_hwnd(&self, win: usize) -> Option<isize> {
+        self.all_wins().find(|w| w.id == win).map(|w| w.window.hwnd() as isize)
+    }
+
+    fn win_tabs(&self) -> impl Iterator<Item = &Tab> {
+        let id = self.w.id;
+        self.tabs.iter().filter(move |t| t.win == id)
+    }
+
+    /// Opens the AI panel in the current window (it follows you: only one window shows it).
+    fn open_ai_here(&mut self) {
+        self.w.ai_open = true;
+        let me = self.w.id;
+        if self.ai_owner != me {
+            for o in self.wins.iter_mut() {
+                o.ai_open = false;
+            }
+            self.ai_owner = me;
+        }
+        self.ensure_ai();
+        reparent(AI_ID, self.w.window.hwnd() as isize);
+    }
+
+    /// Takes a tab out of its window and puts it in `to`. Closes the old window if that leaves it empty.
+    fn move_tab(&mut self, tab: usize, to: usize) {
+        let Some(from) = self.tabs.iter().find(|t| t.id == tab).map(|t| t.win) else { return };
+        if from == to {
+            return;
+        }
+        let Some(hwnd) = self.win_hwnd(to) else { return };
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+            t.win = to;
+            t.last_active = Instant::now();
+        }
+        reparent(tab, hwnd);
+        // the window it left
+        self.focus_win(from);
+        if self.w.active == tab {
+            let next = self.win_tabs().last().map(|t| t.id);
+            match next {
+                Some(n) => self.activate(n),
+                None => {
+                    self.w.active = 0;
+                    self.want_close = Some(from);
+                }
+            }
+        } else {
+            self.layout();
+        }
+        // the window it joined
+        self.focus_win(to);
+        self.activate(tab);
+        self.w.window.set_focus();
+    }
+
+    /// Where a dragged tab would land if released at `pt`: the window under the mouse (not the source),
+    /// and whether it has been pulled far enough from its own strip to become a new window.
+    fn drag_target(&self, src: usize, pt: windows::Win32::Foundation::POINT) -> (Option<usize>, bool) {
+        let inside = |w: &Win| {
+            let (Ok(p), s) = (w.window.outer_position(), w.window.outer_size()) else { return false };
+            pt.x >= p.x && pt.x < p.x + s.width as i32 && pt.y >= p.y && pt.y < p.y + s.height as i32
+        };
+        let over_other = self.all_wins().filter(|w| w.id != src).find(|w| inside(w)).map(|w| w.id);
+        let torn = self.all_wins().find(|w| w.id == src).is_some_and(|w| {
+            let Ok(p) = w.window.outer_position() else { return true };
+            let k = w.window.scale_factor();
+            let near = 40.0 * k;
+            let (rel_x, rel_y) = ((pt.x - p.x) as f64, (pt.y - p.y) as f64);
+            if !inside(w) {
+                return true;
+            }
+            if self.cfg.vertical_tabs {
+                rel_x > SIDEBAR_W * k + near
+            } else {
+                rel_y > (TOOLBAR_H + TABSTRIP_H) * k + near
+            }
+        });
+        (over_other, torn)
+    }
+
+    /// Draws (or hides) the outline that shows what releasing the tab here will do.
+    fn drag_ghost(&mut self, rect: Option<(i32, i32, i32, i32)>) {
+        use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, RGN_DIFF, SetWindowRgn};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let Some((x, y, w, h)) = rect else {
+            if let Some(g) = self.ghost {
+                unsafe {
+                    let _ = ShowWindow(HWND(g as *mut _), SW_HIDE);
+                }
+            }
+            return;
+        };
+        unsafe {
+            if self.ghost.is_none() {
+                // a plain white rectangle control, made see-through, click-through and always on top
+                let hw = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                    windows::core::w!("STATIC"),
+                    windows::core::w!(""),
+                    WS_POPUP | WINDOW_STYLE(0x6),
+                    x,
+                    y,
+                    w,
+                    h,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let Ok(hw) = hw else { return };
+                let _ = SetLayeredWindowAttributes(hw, windows::Win32::Foundation::COLORREF(0), 190, LWA_ALPHA);
+                self.ghost = Some(hw.0 as isize);
+            }
+            let hw = HWND(self.ghost.unwrap() as *mut _);
+            let _ = SetWindowPos(hw, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            // hollow it out: keep only a frame
+            let t = 4;
+            let outer = CreateRectRgn(0, 0, w, h);
+            let inner = CreateRectRgn(t, t, (w - t).max(t), (h - t).max(t));
+            let _ = CombineRgn(Some(outer), Some(outer), Some(inner), RGN_DIFF);
+            let _ = SetWindowRgn(hw, Some(outer), true);
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(inner.into());
+        }
+    }
+
+    fn drag_ghost_close(&mut self) {
+        if let Some(g) = self.ghost.take() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(HWND(g as *mut _));
+            }
+        }
+    }
+
+    /// Called every loop turn during a tab drag: shows where it would land, and when the mouse
+    /// button comes up decides where the tab goes.
+    fn poll_drag(&mut self) {
+        let Some((tab, src)) = self.drag else { return };
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }.is_err() {
+            self.drag = None;
+            self.drag_ghost_close();
+            return;
+        }
+        let (over_other, torn) = self.drag_target(src, pt);
+        let down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000 != 0;
+        if down {
+            let k = self.all_wins().find(|w| w.id == src).map(|w| w.window.scale_factor()).unwrap_or(1.0);
+            let rect = if let Some(o) = over_other {
+                self.all_wins().find(|w| w.id == o).and_then(|w| {
+                    let p = w.window.outer_position().ok()?;
+                    let s = w.window.outer_size();
+                    Some((p.x, p.y, s.width as i32, s.height as i32))
+                })
+            } else if torn {
+                let (w, h) = ((640.0 * k) as i32, (400.0 * k) as i32);
+                Some((pt.x - (120.0 * k) as i32, pt.y - (18.0 * k) as i32, w, h))
+            } else {
+                None
+            };
+            self.drag_ghost(rect);
+            return;
+        }
+        self.drag = None;
+        self.drag_ghost_close();
+        if let Some(src_win) = self.all_wins().find(|w| w.id == src).map(|w| w.ui_id) {
+            let js = "window.ui&&window.ui.dragEnd&&window.ui.dragEnd()";
+            BROWSERS.with(|m| {
+                if let Some(f) = m.borrow().get(&src_win).and_then(|b| b.main_frame()) {
+                    f.execute_java_script(Some(&cs(js)), Some(&cs("imc://ui")), 0);
+                }
+            });
+        }
+        if let Some(to) = over_other {
+            self.move_tab(tab, to);
+        } else if torn {
+            self.focus_win(src);
+            let k = self.w.window.scale_factor();
+            let (x, y) = (pt.x - (120.0 * k) as i32, pt.y - (18.0 * k) as i32);
+            if self.win_tabs().count() <= 1 {
+                self.w.window.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
+            } else {
+                let sz = if self.w.window.is_maximized() { None } else { Some(self.w.window.inner_size()) };
+                let (w, h) = sz.map(|s| (s.width, s.height)).unwrap_or(((1280.0 * k) as u32, (800.0 * k) as u32));
+                self.want_window = Some((tab, x, y, w, h));
+            }
+        }
+    }
+
+    /// Closes a window with everything in it (or quits when it is the last one: returns true).
+    fn close_window(&mut self, id: usize) -> bool {
+        if self.wins.is_empty() {
+            return true;
+        }
+        if self.w.id == id {
+            let other = self.wins[0].id;
+            self.focus_win(other);
+        }
+        let ids: Vec<usize> = self.tabs.iter().filter(|t| t.win == id).map(|t| t.id).collect();
+        for t in ids {
+            self.drop_tab(t);
+        }
+        if self.ai_owner == id {
+            self.w.ai_open = false;
+            self.ai_owner = self.w.id;
+            reparent(AI_ID, self.w.window.hwnd() as isize);
+            place(AI_ID, 0, 0, 0, 0, false);
+        }
+        if let Some(i) = self.wins.iter().position(|w| w.id == id) {
+            let w = self.wins.remove(i);
+            if let Some(b) = BROWSERS.with(|m| m.borrow_mut().remove(&w.ui_id)) {
+                if let Some(h) = b.host() {
+                    h.close_browser(1);
+                }
+            }
+            drop(w);
+        }
+        self.layout();
+        self.push();
+        false
+    }
+
     fn spawn(&mut self, id: usize, url: &str, private: bool) -> bool {
         let r = self.content_rect();
-        let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(sys::HWND(self.window.hwnd() as *mut _), &r);
+        let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(sys::HWND(self.w.window.hwnd() as *mut _), &r);
         let mut client = Cl::new(id, self.tx.clone(), Some(self.shield.clone()), private, self.dl_ids.clone());
         let mut ctx = if private {
             if self.ghost_ctx.is_none() {
@@ -883,7 +1194,7 @@ impl Shell {
         let id = self.next;
         self.next += 1;
         self.spawn(id, url, private);
-        self.tabs.push(Tab { id, url: url.into(), title: String::new(), loading: true, audible: false, muted: false, private, frozen: false, zoom: 1.0, favicon: None, fav_url: String::new(), last_active: Instant::now() });
+        self.tabs.push(Tab { id, win: self.w.id, url: url.into(), title: String::new(), loading: true, audible: false, muted: false, private, frozen: false, zoom: 1.0, favicon: None, fav_url: String::new(), last_active: Instant::now() });
         id
     }
 
@@ -904,7 +1215,7 @@ impl Shell {
     /// Hibernate: tabs unused for `freeze_after_secs` (and not making sound) release their whole renderer.
     fn tick(&mut self) {
         let limit = Duration::from_secs(self.cfg.freeze_after_secs);
-        let stale: Vec<usize> = self.tabs.iter().filter(|t| t.id != self.active && !t.frozen && !t.audible && t.last_active.elapsed() >= limit).map(|t| t.id).collect();
+        let stale: Vec<usize> = self.tabs.iter().filter(|t| !self.shown(t.id) && !t.frozen && !t.audible && t.last_active.elapsed() >= limit).map(|t| t.id).collect();
         for id in stale {
             self.discard(id);
             if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
@@ -913,7 +1224,7 @@ impl Shell {
             }
         }
         if std::env::var_os("IMC_SELFTEST").is_some() {
-            let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}|{}|{}|fav={}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.active { "*" } else { "" }, t.url, t.title, t.favicon.as_ref().map(|f| f.len()).unwrap_or(0))).collect();
+            let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}|{}|{}|fav={}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.w.active { "*" } else { "" }, t.url, t.title, t.favicon.as_ref().map(|f| f.len()).unwrap_or(0))).collect();
             eprintln!("SELFTEST tabs [{}] ghost_ctx={}", sum.join(" "), self.ghost_ctx.is_some());
             eprintln!("SELFTEST downloads {:?}", self.downloads.iter().map(|d| (d.name.clone(), d.state.clone(), d.received, d.total, d.path.clone())).collect::<Vec<_>>());
         }
@@ -928,7 +1239,7 @@ impl Shell {
         }
         let saved: Vec<&Tab> = self.tabs.iter().filter(|t| !t.private && t.url.starts_with("http")).collect();
         let urls: Vec<&str> = saved.iter().map(|t| t.url.as_str()).collect();
-        let active = saved.iter().position(|t| t.id == self.active).unwrap_or(0);
+        let active = saved.iter().position(|t| t.id == self.w.active).unwrap_or(0);
         let _ = std::fs::write(path, json!({"tabs": urls, "active": active}).to_string());
     }
 
@@ -944,29 +1255,31 @@ impl Shell {
     }
 
     fn content_rect(&self) -> Rect {
-        let s = self.window.inner_size();
-        let k = self.window.scale_factor();
+        let s = self.w.window.inner_size();
+        let k = self.w.window.scale_factor();
         let (left, top) = if self.cfg.vertical_tabs { (SIDEBAR_W, TITLEBAR_H + TOOLBAR_H) } else { (0.0, TOOLBAR_H + TABSTRIP_H) };
         let (x, y) = ((left * k) as i32, (top * k) as i32);
         Rect { x, y, width: (s.width as i32 - x).max(0), height: (s.height as i32 - y).max(0) }
     }
 
     fn layout(&self) {
-        let s = self.window.inner_size();
-        place(UI_ID, 0, 0, s.width as i32, s.height as i32, true);
+        let s = self.w.window.inner_size();
+        place(self.w.ui_id, 0, 0, s.width as i32, s.height as i32, true);
         let r = self.content_rect();
-        let k = self.window.scale_factor();
-        let ai_on = self.ai_open && self.cfg.ai.enabled && !self.panel;
+        let k = self.w.window.scale_factor();
+        let ai_on = self.w.ai_open && self.cfg.ai.enabled && !self.w.panel;
         // the panel takes the right side; a gap keeps the drag handle (drawn by the chrome UI) visible
         let pw = if ai_on { ((self.cfg.ai.width_clamped() as f64 * k) as i32).min((r.width - (320.0 * k) as i32).max(0)) } else { 0 };
         let gap = if ai_on { (AI_GAP * k) as i32 } else { 0 };
         let page_w = (r.width - pw - gap).max(0);
-        for t in &self.tabs {
-            let show = t.id == self.active && !self.panel;
+        for t in self.win_tabs() {
+            let show = t.id == self.w.active && !self.w.panel;
             place(t.id, r.x, r.y, page_w, r.height, show);
         }
         let head = (AI_HEAD_H * k) as i32;
-        place(AI_ID, r.x + r.width - pw, r.y + head, pw, (r.height - head).max(0), ai_on);
+        if ai_on || self.ai_owner == self.w.id {
+            place(AI_ID, r.x + r.width - pw, r.y + head, pw, (r.height - head).max(0), ai_on);
+        }
     }
 
     /// Creates the AI panel's browser the first time it is needed (shares the normal login session).
@@ -1011,8 +1324,11 @@ impl Shell {
     }
 
     fn activate(&mut self, id: usize) {
+        if let Some(w) = self.tabs.iter().find(|t| t.id == id).map(|t| t.win) {
+            self.focus_win(w);
+        }
         if self.tabs.iter().any(|t| t.id == id) {
-            let prev = self.active;
+            let prev = self.w.active;
             if let Some(t) = self.tabs.iter_mut().find(|t| t.id == prev) {
                 t.last_active = Instant::now();
             }
@@ -1031,12 +1347,12 @@ impl Shell {
             if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
                 t.last_active = Instant::now();
             }
-            self.active = id;
+            self.w.active = id;
             BROWSERS.with(|m| {
                 for (bid, b) in m.borrow().iter() {
-                    if *bid != UI_ID {
+                    if !is_ui(*bid) && *bid != AI_ID {
                         if let Some(h) = b.host() {
-                            h.was_hidden((*bid != id) as i32);
+                            h.was_hidden((*bid != id && !self.shown(*bid)) as i32);
                         }
                     }
                 }
@@ -1051,7 +1367,8 @@ impl Shell {
         }
     }
 
-    fn close(&mut self, id: usize) {
+    /// Closes a tab's browser and forgets it, without choosing a replacement.
+    fn drop_tab(&mut self, id: usize) {
         if let Some(t) = self.tabs.iter().find(|t| t.id == id && !t.private && t.url.starts_with("http")) {
             self.closed.push(t.url.clone());
             if self.closed.len() > 20 {
@@ -1064,20 +1381,32 @@ impl Shell {
             }
         }
         self.tabs.retain(|t| t.id != id);
-        if self.tabs.is_empty() {
-            let home = self.cfg.home.clone();
-            let n = self.new_tab(&home, false);
-            self.activate(n);
-        } else if self.active == id {
-            let n = self.tabs.last().unwrap().id;
-            self.activate(n);
-        } else {
-            self.push();
+    }
+
+    fn close(&mut self, id: usize) {
+        if let Some(w) = self.tabs.iter().find(|t| t.id == id).map(|t| t.win) {
+            self.focus_win(w);
+        }
+        self.drop_tab(id);
+        let last = self.win_tabs().last().map(|t| t.id);
+        match last {
+            None if !self.wins.is_empty() => {
+                // a window with no tabs left goes away; the others carry on
+                let me = self.w.id;
+                self.want_close = Some(me);
+            }
+            None => {
+                let home = self.cfg.home.clone();
+                let n = self.new_tab(&home, false);
+                self.activate(n);
+            }
+            Some(n) if self.w.active == id => self.activate(n),
+            Some(_) => self.push(),
         }
     }
 
     fn with_active<R>(&self, f: impl FnOnce(&Browser) -> R) -> Option<R> {
-        BROWSERS.with(|m| m.borrow().get(&self.active).map(f))
+        BROWSERS.with(|m| m.borrow().get(&self.w.active).map(f))
     }
 
     fn set_browser_zoom(&self, id: usize, factor: f64) {
@@ -1103,7 +1432,7 @@ impl Shell {
     }
 
     fn zoom_cmd(&mut self, dir: &str) {
-        let Some(t) = self.tabs.iter_mut().find(|t| t.id == self.active) else { return };
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == self.w.active) else { return };
         let next = config::zoom_step(t.zoom, dir);
         if (next - t.zoom).abs() < 0.001 {
             return;
@@ -1181,7 +1510,7 @@ impl Shell {
 
     /// Certificate and connection details for the open page (the lock popup).
     fn site_info(&self) {
-        let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        let Some(t) = self.tabs.iter().find(|t| t.id == self.w.active) else { return };
         let url = t.url.clone();
         let web = url.starts_with("http://") || url.starts_with("https://");
         // Windows FILETIME-style base time (microseconds since 1601) -> unix seconds
@@ -1211,7 +1540,7 @@ impl Shell {
 
     /// Clears cookies, site data or the HTTP cache. Site data runs in the page, so it covers that page's origin.
     fn site_clear(&self, kind: &str) {
-        let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        let Some(t) = self.tabs.iter().find(|t| t.id == self.w.active) else { return };
         let site = adblock::registrable(host_of(&t.url)).to_string();
         let Some(browser) = BROWSERS.with(|m| m.borrow().get(&t.id).cloned()) else { return };
         let Some(host) = browser.host() else { return };
@@ -1329,7 +1658,7 @@ impl Shell {
 
     /// Fill only on an explicit click, only on an HTTPS page, only the main frame's matching fields.
     fn fill_card(&self, i: usize) {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == self.w.active) else { return };
         if !tab.url.starts_with("https://") {
             self.toast("Not filled: card details are only filled on HTTPS pages.");
             return;
@@ -1364,7 +1693,7 @@ impl Shell {
 
     /// Credential list without secrets; `match` flags entries for the active site.
     fn push_creds(&self) {
-        let active_host = self.tabs.iter().find(|t| t.id == self.active).map(|t| passwords::host(&t.url)).unwrap_or_default();
+        let active_host = self.tabs.iter().find(|t| t.id == self.w.active).map(|t| passwords::host(&t.url)).unwrap_or_default();
         let list: Vec<Value> = passwords::load()
             .iter()
             .enumerate()
@@ -1379,7 +1708,7 @@ impl Shell {
 
     /// Fill only on explicit click, only over HTTPS, only on the saved site's own domain.
     fn fill_password(&self, i: usize) {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == self.w.active) else { return };
         let c = passwords::load();
         let Some(cred) = c.get(i) else { return };
         let same = adblock::registrable(&passwords::host(&cred.url)) == adblock::registrable(&passwords::host(&tab.url));
@@ -1436,7 +1765,7 @@ impl Shell {
     fn on_control(&mut self, r: control::Request) {
         let control::Request { body, reply } = r;
         let cmd = body["cmd"].as_str().unwrap_or("").to_string();
-        let tab = body["tab"].as_u64().map(|v| v as usize).unwrap_or(self.active);
+        let tab = body["tab"].as_u64().map(|v| v as usize).unwrap_or(self.w.active);
         let short = |s: &str| s.chars().take(80).collect::<String>();
         control::audit(match cmd.as_str() {
             "open" | "navigate" => format!("{cmd} {}", short(body["url"].as_str().unwrap_or(""))),
@@ -1468,7 +1797,7 @@ impl Shell {
                 let _ = reply.send(json!({"ok": true, "version": updater::VERSION, "build": updater::BUILD_ID, "tabs": self.tabs.iter().filter(|t| !t.private).count(), "js_allowed": self.cfg.control.allow_js}));
             }
             "tabs" => {
-                let list: Vec<Value> = self.tabs.iter().filter(|t| !t.private).map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "active": t.id == self.active, "loading": t.loading})).collect();
+                let list: Vec<Value> = self.tabs.iter().filter(|t| !t.private).map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "active": t.id == self.w.active, "loading": t.loading})).collect();
                 let _ = reply.send(json!({"ok": true, "tabs": list}));
             }
             "open" => {
@@ -1493,7 +1822,7 @@ impl Shell {
                 let _ = reply.send(json!({"ok": true}));
             }
             "switch" | "close" => {
-                let id = body["id"].as_u64().map(|v| v as usize).unwrap_or(self.active);
+                let id = body["id"].as_u64().map(|v| v as usize).unwrap_or(self.w.active);
                 if !self.tabs.iter().any(|t| t.id == id && !t.private) {
                     return fail("no such tab (Ghost tabs cannot be controlled)");
                 }
@@ -1523,7 +1852,7 @@ impl Shell {
                 if cmd == "text" { f.text(Some(&mut g)) } else { f.source(Some(&mut g)) }
             }
             "screenshot" => {
-                if tab != self.active {
+                if tab != self.w.active {
                     return fail("switch to that tab first (screenshots need it on screen)");
                 }
                 self.cdp(tab, "Page.captureScreenshot", json!({"format": "png"}), reply, |raw| match raw["result"]["data"].as_str() {
@@ -1584,13 +1913,13 @@ impl Shell {
             "stop" => json!({"cmd": "stop"}),
             "new_tab" => json!({"cmd": "new"}),
             "new_ghost" => json!({"cmd": "new", "private": true}),
-            "close_tab" => json!({"cmd": "close", "id": self.active}),
+            "close_tab" => json!({"cmd": "close", "id": self.w.active}),
             "reopen" => json!({"cmd": "reopen"}),
             "next_tab" => json!({"cmd": "tab_next"}),
             "prev_tab" => json!({"cmd": "tab_prev"}),
             "home" => json!({"cmd": "go", "text": self.cfg.home}),
             "bookmark" => json!({"cmd": "bookmark"}),
-            "mute_tab" => json!({"cmd": "mute", "id": self.active}),
+            "mute_tab" => json!({"cmd": "mute", "id": self.w.active}),
             "fullscreen" => json!({"cmd": "fullscreen"}),
             "ai_toggle" => json!({"cmd": "ai_toggle"}),
             "print" => json!({"cmd": "print"}),
@@ -1604,45 +1933,56 @@ impl Shell {
 
     fn eval_ui(&self, js: &str) {
         BROWSERS.with(|m| {
-            if let Some(f) = m.borrow().get(&UI_ID).and_then(|b| b.main_frame()) {
+            if let Some(f) = m.borrow().get(&self.w.ui_id).and_then(|b| b.main_frame()) {
                 f.execute_java_script(Some(&cs(js)), Some(&cs("imc://ui")), 0);
             }
         });
     }
 
     fn push(&self) {
+        for w in self.all_wins() {
+            self.push_win(w);
+        }
+    }
+
+    fn push_win(&self, w: &Win) {
         // Taskbar / Alt-Tab title follows the open tab (Ghost tabs stay generic so their pages are not shown there).
-        let title = match self.tabs.iter().find(|t| t.id == self.active) {
+        let title = match self.tabs.iter().find(|t| t.id == w.active) {
             Some(t) if t.private => "Ghost tab - IMC Browse".to_string(),
             Some(t) if !t.title.is_empty() => format!("{} - IMC Browse", t.title),
             _ => "IMC Browse".to_string(),
         };
-        if self.window.title() != title {
-            self.window.set_title(&title);
+        if w.window.title() != title {
+            w.window.set_title(&title);
         }
-        if !self.ui_ready {
+        if !w.ui_ready {
             return;
         }
         let state = json!({
-            "tabs": self.tabs.iter().map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "frozen": t.frozen, "loading": t.loading, "audible": t.audible, "muted": t.muted, "private": t.private, "zoom": (t.zoom * 100.0).round(), "favicon": t.favicon})).collect::<Vec<_>>(),
-            "active": self.active,
+            "tabs": self.tabs.iter().filter(|t| t.win == w.id).map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "frozen": t.frozen, "loading": t.loading, "audible": t.audible, "muted": t.muted, "private": t.private, "zoom": (t.zoom * 100.0).round(), "favicon": t.favicon})).collect::<Vec<_>>(),
+            "active": w.active,
             "bookmarks": self.bookmarks,
             "blocked": self.shield.blocked.load(Ordering::Relaxed),
             "adblock": self.shield.enabled.load(Ordering::Relaxed),
             "vpn": {"enabled": self.cfg.vpn.enabled, "down": self.cfg.vpn.enabled && vpn::TUNNEL_DOWN.load(Ordering::Relaxed)},
             "cfg": self.cfg,
             "extensions": [],
-            "maximized": self.window.is_maximized(),
+            "maximized": w.window.is_maximized(),
             "restore_tabs": self.cfg.restore_tabs,
             "save_history": self.cfg.save_history,
             "default_browser": {"is_default": defaultbrowser::is_default(), "check": self.cfg.default_check},
-            "ai": {"open": self.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
+            "ai": {"open": w.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
             "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some(), "error": e.error})).collect::<Vec<_>>(),
             "control": {"enabled": self.cfg.control.enabled, "allow_js": self.cfg.control.allow_js},
             "ai_sites": config::AI_SITES.iter().map(|(id, n, _)| json!({"id": id, "name": n})).collect::<Vec<_>>(),
             "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
         });
-        self.eval_ui(&format!("window.ui&&window.ui.set({state})"));
+        let js = format!("window.ui&&window.ui.set({state})");
+        BROWSERS.with(|m| {
+            if let Some(f) = m.borrow().get(&w.ui_id).and_then(|b| b.main_frame()) {
+                f.execute_java_script(Some(&cs(&js)), Some(&cs("imc://ui")), 0);
+            }
+        });
     }
 
     /// Returns true when the app should restart/quit.
@@ -1651,7 +1991,7 @@ impl Shell {
         let cmd = m["cmd"].as_str().unwrap_or("");
         match cmd {
             "ready" => {
-                self.ui_ready = true;
+                self.w.ui_ready = true;
                 self.push();
                 if self.cfg.default_check && !self.default_asked {
                     self.default_asked = true;
@@ -1693,7 +2033,7 @@ impl Shell {
                 self.with_active(|b| b.reload());
             }
             "panel" => {
-                self.panel = m["open"].as_bool().unwrap_or(false);
+                self.w.panel = m["open"].as_bool().unwrap_or(false);
                 self.layout();
             }
             "engine" => {
@@ -1714,7 +2054,7 @@ impl Shell {
                 self.push();
             }
             "bookmark" => {
-                if let Some(t) = self.tabs.iter().find(|t| t.id == self.active && !t.private) {
+                if let Some(t) = self.tabs.iter().find(|t| t.id == self.w.active && !t.private) {
                     if let Some(i) = self.bookmarks.iter().position(|b| b.url == t.url) {
                         self.bookmarks.remove(i);
                     } else if t.url.starts_with("http") {
@@ -1742,8 +2082,8 @@ impl Shell {
                 });
             }
             "fullscreen" => {
-                let on = self.window.fullscreen().is_none();
-                self.window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+                let on = self.w.window.fullscreen().is_none();
+                self.w.window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
             }
             "reopen" => {
                 if let Some(u) = self.closed.pop() {
@@ -1764,7 +2104,7 @@ impl Shell {
                     let js = format!("window.__imcGset&&window.__imcGset({page})");
                     BROWSERS.with(|b| {
                         for (id, br) in b.borrow().iter() {
-                            if *id != UI_ID {
+                            if !is_ui(*id) {
                                 if let Some(f) = br.main_frame() {
                                     f.execute_java_script(Some(&cs(&js)), Some(&cs("imc://gestures")), 0);
                                 }
@@ -1775,16 +2115,16 @@ impl Shell {
                 }
             }
             "tab_next" | "tab_prev" => {
-                if let Some(i) = self.tabs.iter().position(|t| t.id == self.active) {
-                    let n = self.tabs.len();
+                let mine: Vec<usize> = self.win_tabs().map(|t| t.id).collect();
+                if let Some(i) = mine.iter().position(|&t| t == self.w.active) {
+                    let n = mine.len();
                     let j = if m["cmd"] == "tab_next" { (i + 1) % n } else { (i + n - 1) % n };
-                    let id = self.tabs[j].id;
-                    self.activate(id);
+                    self.activate(mine[j]);
                 }
             }
             "focus_url" => {
                 BROWSERS.with(|b| {
-                    if let Some(h) = b.borrow().get(&UI_ID).and_then(|b| b.host()) {
+                    if let Some(h) = b.borrow().get(&self.w.ui_id).and_then(|b| b.host()) {
                         h.set_focus(1);
                     }
                 });
@@ -1864,16 +2204,17 @@ impl Shell {
             }
             "ai_toggle" => {
                 if self.cfg.ai.enabled {
-                    self.ai_open = !self.ai_open;
-                    if self.ai_open {
-                        self.ensure_ai();
+                    if self.w.ai_open {
+                        self.w.ai_open = false;
+                    } else {
+                        self.open_ai_here();
                     }
                     self.layout();
                     self.push();
                 }
             }
             "ai_close" => {
-                self.ai_open = false;
+                self.w.ai_open = false;
                 self.layout();
                 self.push();
             }
@@ -1898,8 +2239,8 @@ impl Shell {
                     self.toast("That address is not valid. It must start with https://");
                 }
                 if !self.cfg.ai.enabled {
-                    self.ai_open = false;
-                } else if changed && self.ai_open {
+                    self.w.ai_open = false;
+                } else if changed && self.w.ai_open {
                     self.ai_navigate();
                 } else if changed {
                     // forget the old site's page; the new one loads when the panel is next opened
@@ -1923,7 +2264,7 @@ impl Shell {
                 self.push();
             }
             "ai_send" => {
-                let private = self.tabs.iter().any(|t| t.id == self.active && t.private);
+                let private = self.tabs.iter().any(|t| t.id == self.w.active && t.private);
                 if private {
                     self.toast("Ghost tab content is never sent to an AI site.");
                 } else if self.cfg.ai.url().is_none() {
@@ -2045,13 +2386,43 @@ impl Shell {
             "zoom_out" => self.zoom_cmd("out"),
             "zoom_reset" => self.zoom_cmd("reset"),
             "win_drag" => {
-                let _ = self.window.drag_window();
+                let _ = self.w.window.drag_window();
             }
-            "win_min" => self.window.set_minimized(true),
-            "win_max" => self.window.set_maximized(!self.window.is_maximized()),
+            "win_min" => self.w.window.set_minimized(true),
+            "win_max" => self.w.window.set_maximized(!self.w.window.is_maximized()),
             "win_close" => {
-                self.save_session();
-                return true;
+                if self.wins.is_empty() {
+                    self.save_session();
+                    return true;
+                }
+                let me = self.w.id;
+                self.want_close = Some(me);
+            }
+            "tab_order" => {
+                // the strip was reordered: put this window's tabs in that order, leaving other windows' tabs where they are
+                let order: Vec<usize> = m["ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|v| v as usize)).collect()).unwrap_or_default();
+                let me = self.w.id;
+                let slots: Vec<usize> = self.tabs.iter().enumerate().filter(|(_, t)| t.win == me).map(|(i, _)| i).collect();
+                if order.len() == slots.len() {
+                    let mut mine: Vec<Tab> = slots.iter().rev().map(|&i| self.tabs.remove(i)).collect();
+                    mine.reverse();
+                    let mut sorted: Vec<Tab> = vec![];
+                    for id in &order {
+                        if let Some(i) = mine.iter().position(|t| t.id == *id) {
+                            sorted.push(mine.remove(i));
+                        }
+                    }
+                    sorted.append(&mut mine);
+                    for (k, t) in sorted.into_iter().enumerate() {
+                        self.tabs.insert(slots[k].min(self.tabs.len()), t);
+                    }
+                }
+                self.push();
+            }
+            "tab_drag" => {
+                if let Some(tab) = m["id"].as_u64().map(|v| v as usize) {
+                    self.drag = Some((tab, self.w.id));
+                }
             }
             "adblock" => {
                 let on = !self.shield.enabled.load(Ordering::Relaxed);
@@ -2289,12 +2660,7 @@ fn main() {
 
     let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
     let tx = event_loop.create_proxy();
-    let window = WindowBuilder::new()
-        .with_title("IMC Browse (CEF)")
-        .with_decorations(false)
-        .with_inner_size(LogicalSize::new(1280.0, 800.0))
-        .build(&event_loop)
-        .expect("window");
+    let window = build_window(&event_loop, None, None);
 
     // The chrome UI is a local file so it can be a normal page.
     let ui_dir = config::root().join("ui");
@@ -2303,15 +2669,7 @@ fn main() {
     let _ = std::fs::write(&ui_file, CHROME_HTML);
     let ui_url = format!("file:///{}", ui_file.to_string_lossy().replace('\\', "/"));
 
-    let size = window.inner_size();
-    let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(
-        sys::HWND(window.hwnd() as *mut _),
-        &Rect { x: 0, y: 0, width: size.width as i32, height: size.height as i32 },
-    );
-    let mut ui_client = Cl::new(UI_ID, tx.clone(), None, false, Arc::new(AtomicU64::new(0)));
-    let ui = browser_host_create_browser_sync(Some(&info), Some(&mut ui_client), Some(&cs(&ui_url)), Some(&BrowserSettings::default()), None, None)
-        .expect("chrome ui");
-    BROWSERS.with(|m| m.borrow_mut().insert(UI_ID, ui));
+    create_ui(&window, UI_ID, &ui_url, &tx);
 
     let engine = load_engine();
     let css = engine.cosmetic_css();
@@ -2331,15 +2689,20 @@ fn main() {
     }
     let downloads = downloads::load();
     let mut state = Shell {
-        window,
+        w: Win { id: 0, window, ui_id: UI_ID, active: 0, panel: false, ai_open: false, ui_ready: false },
+        wins: vec![],
+        next_win: 1,
+        ui_url: ui_url.clone(),
+        want_window: None,
+        want_close: None,
+        drag: None,
+        ghost: None,
+        ai_owner: 0,
         tx: tx.clone(),
         tabs: vec![],
-        active: 0,
         next: 1,
         cfg: cfg.clone(),
-        panel: false,
         bookmarks: bookmarks::load(),
-        ui_ready: false,
         shield,
         ghost_ctx: None,
         closed: vec![],
@@ -2449,20 +2812,45 @@ fn main() {
             let _ = t.send_event(Ev::Ipc(msg.to_string()));
         });
     }
-    event_loop.run(move |event, _, flow| {
+    event_loop.run(move |event, target, flow| {
         match event {
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                state.save_session();
-                history::flush();
-                finish();
-                *flow = ControlFlow::Exit;
-                return;
+            Event::WindowEvent { event: WindowEvent::CloseRequested, window_id, .. } => {
+                let win = state.win_of_window(window_id);
+                if state.wins.is_empty() || win.is_none() {
+                    state.save_session();
+                    history::flush();
+                    finish();
+                    *flow = ControlFlow::Exit;
+                    return;
+                }
+                state.want_close = win;
             }
-            Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
-                state.layout();
-                state.push();
+            Event::WindowEvent { event: WindowEvent::Resized(_), window_id, .. } => {
+                let found = state.win_of_window(window_id);
+                if let Some(win) = found {
+                    state.focus_win(win);
+                    state.layout();
+                    state.push();
+                }
+            }
+            Event::WindowEvent { event: WindowEvent::Focused(true), window_id, .. } => {
+                let found = state.win_of_window(window_id);
+                if let Some(win) = found {
+                    state.focus_win(win);
+                }
             }
             Event::UserEvent(ev) => match ev {
+                Ev::IpcFrom(ui, s) => {
+                    if let Some(win) = state.win_of_ui(ui) {
+                        state.focus_win(win);
+                    }
+                    if state.ipc(&s) {
+                        history::flush();
+                        finish();
+                        *flow = ControlFlow::Exit;
+                        return;
+                    }
+                }
                 Ev::Ipc(s) => {
                     if state.ipc(&s) {
                         finish();
@@ -2539,8 +2927,7 @@ fn main() {
                     let head = if selected { format!("I selected this text on the page \"{title}\" ({url}):") } else { format!("Here is the page \"{title}\" ({url}):") };
                     let msg = format!("{head}\n\n{text}\n\n");
                     let fresh = !BROWSERS.with(|m| m.borrow().contains_key(&AI_ID));
-                    state.ai_open = true;
-                    state.ensure_ai();
+                    state.open_ai_here();
                     state.layout();
                     state.push();
                     if fresh {
@@ -2577,12 +2964,32 @@ fn main() {
                     }
                 }
                 Ev::Open(u) => {
-                    let private = state.tabs.iter().any(|t| t.id == state.active && t.private);
+                    let private = state.tabs.iter().any(|t| t.id == state.w.active && t.private);
                     let n = state.new_tab(&u, private);
                     state.activate(n);
                 }
             },
             _ => {}
+        }
+        state.poll_drag();
+        if let Some((tab, x, y, w, h)) = state.want_window.take() {
+            let window = build_window(target, Some((x, y)), Some((w, h)));
+            let id = state.next_win;
+            state.next_win += 1;
+            let ui_id = UI_BASE + id;
+            let (url, tx2) = (state.ui_url.clone(), state.tx.clone());
+            create_ui(&window, ui_id, &url, &tx2);
+            state.wins.push(Win { id, window, ui_id, active: 0, panel: false, ai_open: false, ui_ready: false });
+            state.move_tab(tab, id);
+        }
+        if let Some(id) = state.want_close.take() {
+            if state.close_window(id) {
+                state.save_session();
+                history::flush();
+                finish();
+                *flow = ControlFlow::Exit;
+                return;
+            }
         }
         // Pump CEF about 100 times a second (external message pump is a later optimisation).
         do_message_loop_work();
