@@ -89,16 +89,23 @@ pub fn remove(name: &str) -> Result<(), String> {
 
 fn download(url: &str) -> Result<Vec<u8>, String> {
     // curl.exe ships with Windows 10 1803+; avoids linking a TLS stack just for installs.
-    let tmp = std::env::temp_dir().join(format!("imc-dl-{}.bin", std::process::id()));
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("imc-dl-{}-{nanos}.bin", std::process::id()));
     use std::os::windows::process::CommandExt;
-    let st = Command::new("curl.exe")
+    if !url.starts_with("https://") {
+        return Err("only https addresses can be downloaded".into());
+    }
+    let st = Command::new(crate::sandbox::system_exe("curl.exe"))
         .creation_flags(0x0800_0000) // no console window
-        .args(["-fsSL", "--max-filesize", "104857600", "-o"])
+        // https only, also across redirects; the address goes after `--` so it can never be read as an option
+        .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-filesize", "104857600", "--max-time", "120", "-o"])
         .arg(&tmp)
+        .arg("--")
         .arg(url)
         .status()
         .map_err(|e| format!("curl.exe failed to start: {e}"))?;
     if !st.success() {
+        let _ = fs::remove_file(&tmp);
         return Err(format!("download failed: {url}"));
     }
     let b = fs::read(&tmp).map_err(|e| e.to_string())?;
@@ -130,6 +137,21 @@ fn install_bytes(b: &[u8], id: Option<&str>) -> Result<String, String> {
         name = Some(sanitize(m["name"].as_str().unwrap_or("extension")));
     }
     let dest = extensions_dir().join(name.unwrap());
+    // a package is not allowed to be a zip bomb
+    const MAX_FILES: usize = 20_000;
+    const MAX_FILE: u64 = 50 << 20;
+    const MAX_TOTAL: u64 = 250 << 20;
+    if zip.len() > MAX_FILES {
+        return Err("package has too many files".into());
+    }
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        let f = zip.by_index(i).map_err(|e| e.to_string())?;
+        total += f.size();
+        if f.size() > MAX_FILE || total > MAX_TOTAL {
+            return Err("package is too large".into());
+        }
+    }
     let _ = fs::remove_dir_all(&dest);
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
@@ -143,7 +165,10 @@ fn install_bytes(b: &[u8], id: Option<&str>) -> Result<String, String> {
                 fs::create_dir_all(p).map_err(|e| e.to_string())?;
             }
             let mut data = Vec::new();
-            f.read_to_end(&mut data).map_err(|e| e.to_string())?;
+            (&mut f).take(MAX_FILE + 1).read_to_end(&mut data).map_err(|e| e.to_string())?;
+            if data.len() as u64 > MAX_FILE {
+                return Err("package is too large".into());
+            }
             fs::write(&out, data).map_err(|e| e.to_string())?;
         }
     }

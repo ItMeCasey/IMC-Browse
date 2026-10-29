@@ -98,5 +98,5 @@ pub fn is_default() -> bool {
 
 /// Opens Windows' Default apps settings (the only supported way for the user to pick a browser).
 pub fn open_settings() {
-    let _ = std::process::Command::new("explorer.exe").arg("ms-settings:defaultapps").creation_flags(0x0800_0000).spawn();
+    let _ = std::process::Command::new(crate::sandbox::system_exe("explorer.exe")).arg("ms-settings:defaultapps").creation_flags(0x0800_0000).spawn();
 }

@@ -54,6 +54,12 @@ const TOOLBAR_H: f64 = 52.0;
 const TABSTRIP_H: f64 = 36.0;
 const SIDEBAR_W: f64 = 230.0;
 const TITLEBAR_H: f64 = 32.0;
+/// Test hooks driven by environment variables. They can run privileged commands, so they only exist in
+/// builds made with `--features devhooks`; release builds never read these variables.
+fn dev(name: &str) -> Option<std::ffi::OsString> {
+    if cfg!(feature = "devhooks") { std::env::var_os(name) } else { None }
+}
+
 const UI_ID: usize = 0;
 /// Extra windows get their own chrome UI browser with an id from this range.
 const UI_BASE: usize = usize::MAX / 2;
@@ -88,7 +94,7 @@ enum Ev {
     /// A command from an AI tool over the control pipe.
     Control(control::Request),
     /// Text of the active page (or its selection), requested by "Send page".
-    PageText { title: String, url: String, text: String, selected: bool },
+    PageText { tab: usize, title: String, url: String, text: String, selected: bool },
     /// A page announced its icon(s); we fetch the first.
     FaviconUrl(usize, String),
     /// The icon, as a ready-to-show data: URI (tab id, icon url).
@@ -185,7 +191,7 @@ wrap_display_handler! {
                 return;
             }
             if let Some(first) = urls.cloned().and_then(|l| l.into_iter().next()) {
-                if std::env::var_os("IMC_SELFTEST").is_some() {
+                if dev("IMC_SELFTEST").is_some() {
                     eprintln!("SELFTEST favicon url tab {} {}", self.id, first);
                 }
                 let _ = self.tx.send_event(Ev::FaviconUrl(self.id, first.to_string()));
@@ -210,7 +216,7 @@ wrap_display_handler! {
                             return 1;
                         }
                         if let Some(d) = m.strip_prefix("IMCPOPDBG:") {
-                            if std::env::var_os("IMC_DEBUG_POP").is_some() {
+                            if dev("IMC_DEBUG_POP").is_some() {
                                 eprintln!("POPDBG {d}");
                             }
                             return 1;
@@ -232,14 +238,14 @@ wrap_display_handler! {
                         }
                         return 1;
                     }
-                    if let Some(t) = m.strip_prefix("SELFTEST_AI:") {
+                    if let Some(t) = m.strip_prefix("SELFTEST_AI:").filter(|_| dev("IMC_SELFTEST").is_some()) {
                         eprintln!("SELFTEST ai chat box now holds: {t}");
                         return 1;
                     }
                     if let Some(j) = m.strip_prefix("IMCTXT:") {
                         if let Ok(v) = serde_json::from_str::<Value>(j) {
                             let g = |k: &str| v[k].as_str().unwrap_or("").to_string();
-                            let _ = self.tx.send_event(Ev::PageText { title: g("title"), url: g("url"), text: g("text"), selected: v["selected"].as_bool().unwrap_or(false) });
+                            let _ = self.tx.send_event(Ev::PageText { tab: self.id, title: g("title"), url: g("url"), text: g("text"), selected: v["selected"].as_bool().unwrap_or(false) });
                         }
                         return 1;
                     }
@@ -338,7 +344,14 @@ wrap_life_span_handler! {
             _nojs: Option<&mut i32>,
         ) -> i32 {
             if let Some(u) = target_url {
-                let _ = self.tx.send_event(Ev::Open(u.to_string()));
+                let u = u.to_string();
+                let lower = u.to_ascii_lowercase();
+                let from_extension = _f.as_ref().map(|f| CefString::from(&f.url()).to_string().starts_with("chrome-extension://")).unwrap_or(false);
+                // Websites may open web addresses only: never file:, chrome:, javascript:, imc: or other privileged pages.
+                // (Extension pages may open their own pages.)
+                if lower.starts_with("http://") || lower.starts_with("https://") || lower == "about:blank" || (from_extension && lower.starts_with("chrome-extension://")) {
+                    let _ = self.tx.send_event(Ev::Open(u));
+                }
             }
             1
         }
@@ -351,6 +364,20 @@ wrap_resource_request_handler! {
     impl ResourceRequestHandler {
         fn on_before_resource_load(&self, _b: Option<&mut Browser>, _f: Option<&mut Frame>, _r: Option<&mut Request>, _cb: Option<&mut Callback>) -> ReturnValue {
             ReturnValue::CANCEL
+        }
+    }
+}
+
+// The browser's own UI page must stay on itself: a stray link or redirect must never load a web page in there
+// (that page would then be able to send commands to the browser).
+wrap_request_handler! {
+    struct UiNav;
+    impl RequestHandler {
+        fn on_before_browse(&self, _b: Option<&mut Browser>, _f: Option<&mut Frame>, request: Option<&mut Request>, _gesture: i32, _redirect: i32) -> i32 {
+            let Some(request) = request else { return 1 };
+            let url = CefString::from(&request.url()).to_string();
+            let ok = url.starts_with("file:///") && url.contains("/ui/chrome.html");
+            (!ok) as i32
         }
     }
 }
@@ -635,7 +662,7 @@ wrap_download_image_callback! {
     }
     impl DownloadImageCallback {
         fn on_download_image_finished(&self, _url: Option<&CefString>, status: i32, image: Option<&mut Image>) {
-            if std::env::var_os("IMC_SELFTEST").is_some() {
+            if dev("IMC_SELFTEST").is_some() {
                 eprintln!("SELFTEST favicon downloaded tab {} status {} image {}", self.tab, status, image.is_some());
             }
             if !(200..300).contains(&status) {
@@ -712,6 +739,9 @@ wrap_client! {
             Some(Life::new(self.tx.clone()))
         }
         fn request_handler(&self) -> Option<RequestHandler> {
+            if is_ui(self.id) {
+                return Some(UiNav::new());
+            }
             self.shield.clone().map(|s| Req::new(s, self.tx.clone()))
         }
         fn download_handler(&self) -> Option<DownloadHandler> {
@@ -778,7 +808,7 @@ wrap_app! {
             }
             cmd.append_switch_with_value(Some(&cs("disable-features")), Some(&cs("MediaRouter,Translate,OptimizationHints,AutofillServerCommunication")));
             cmd.append_switch_with_value(Some(&cs("enable-features")), Some(&cs("StrictOriginIsolation")));
-            if std::env::var_os("IMC_TEST_NOTHROTTLE").is_some() {
+            if dev("IMC_TEST_NOTHROTTLE").is_some() {
                 for s in ["disable-backgrounding-occluded-windows", "disable-renderer-backgrounding", "disable-background-timer-throttling"] {
                     cmd.append_switch(Some(&cs(s)));
                 }
@@ -855,6 +885,11 @@ struct Shell {
     /// Its current rectangle in physical pixels (x, y, w, h).
     pop_rect: Option<(i32, i32, i32, i32)>,
     pop_polled: Instant,
+    /// "Send page" was just clicked for this tab: the only time page text is accepted from a page.
+    text_wait: Option<(usize, Instant)>,
+    /// When the right mouse button / Ctrl key were last seen held (real input), so pages cannot fake gestures or zoom.
+    rbutton_at: Option<Instant>,
+    ctrl_at: Option<Instant>,
     /// The window that currently shows the AI panel.
     ai_owner: usize,
     tx: EventLoopProxy<Ev>,
@@ -1338,7 +1373,7 @@ impl Shell {
                 t.loading = false;
             }
         }
-        if std::env::var_os("IMC_SELFTEST").is_some() {
+        if dev("IMC_SELFTEST").is_some() {
             let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}|{}|{}|fav={}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.w.active { "*" } else { "" }, t.url, t.title, t.favicon.as_ref().map(|f| f.len()).unwrap_or(0))).collect();
             eprintln!("SELFTEST tabs [{}] ghost_ctx={}", sum.join(" "), self.ghost_ctx.is_some());
             eprintln!("SELFTEST downloads {:?}", self.downloads.iter().map(|d| (d.name.clone(), d.state.clone(), d.received, d.total, d.path.clone())).collect::<Vec<_>>());
@@ -1362,7 +1397,7 @@ impl Shell {
         self.save_session();
         if let Ok(exe) = std::env::current_exe() {
             use std::os::windows::process::CommandExt;
-            let _ = std::process::Command::new("cmd")
+            let _ = std::process::Command::new(sandbox::system_exe("cmd.exe"))
                 .raw_arg(format!("/C timeout /t 3 /nobreak >nul & start \"\" \"{}\"", exe.display()))
                 .creation_flags(0x0800_0000)
                 .spawn();
@@ -1420,6 +1455,31 @@ impl Shell {
         }
     }
 
+    fn asked_text(&mut self, tab: usize) -> bool {
+        self.text_wait.take().is_some_and(|(t, at)| t == tab && at.elapsed() < Duration::from_secs(20))
+    }
+
+    /// Notes when the real right mouse button and Ctrl key are held. Pages send gesture and zoom requests
+    /// through the console, which any page script can imitate; these only count right after real input.
+    fn poll_input(&mut self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_RBUTTON};
+        let down = |k: u16| unsafe { GetAsyncKeyState(k as i32) } as u16 & 0x8000 != 0;
+        if down(VK_RBUTTON.0) {
+            self.rbutton_at = Some(Instant::now());
+        }
+        if down(VK_CONTROL.0) {
+            self.ctrl_at = Some(Instant::now());
+        }
+    }
+
+    fn rbutton_recent(&self) -> bool {
+        self.rbutton_at.is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+    }
+
+    fn ctrl_recent(&self) -> bool {
+        self.ctrl_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+    }
+
     fn close_popup(&mut self) {
         self.pop = None;
         self.pop_rect = None;
@@ -1453,7 +1513,7 @@ impl Shell {
     }
 
     fn pop_resize(&mut self, w: i32, h: i32) {
-        if std::env::var_os("IMC_SELFTEST").is_some() || std::env::var_os("IMC_DEBUG_POP").is_some() {
+        if dev("IMC_SELFTEST").is_some() || dev("IMC_DEBUG_POP").is_some() {
             eprintln!("POPSIZE {w}x{h}");
         }
         let Some((win, _l, top, right, _)) = self.pop else { return };
@@ -1755,7 +1815,7 @@ impl Shell {
             }
         }
         let info = json!({"url": url, "host": host_of(&url), "secure": url.starts_with("https://"), "local": !web, "internal": url.starts_with("imc://"), "cert": cert, "clearable": web});
-        if std::env::var_os("IMC_SELFTEST").is_some() {
+        if dev("IMC_SELFTEST").is_some() {
             eprintln!("SELFTEST siteinfo {info}");
         }
         self.eval_ui(&format!("window.ui.siteInfo({info})"));
@@ -2025,7 +2085,7 @@ impl Shell {
             }
             "open" => {
                 let url = normalize(body["url"].as_str().unwrap_or(""), &self.cfg.search_engine);
-                if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url.starts_with("imc://")) {
+                if !(url.starts_with("http://") || url.starts_with("https://") || (cfg!(feature = "devhooks") && url.starts_with("file://")) || url.starts_with("imc://")) {
                     return fail("only http, https, file and imc addresses can be opened");
                 }
                 let n = self.new_tab(&url, false);
@@ -2034,7 +2094,7 @@ impl Shell {
             }
             "navigate" => {
                 let url = normalize(body["url"].as_str().unwrap_or(""), &self.cfg.search_engine);
-                if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url.starts_with("imc://")) {
+                if !(url.starts_with("http://") || url.starts_with("https://") || (cfg!(feature = "devhooks") && url.starts_with("file://")) || url.starts_with("imc://")) {
                     return fail("only http, https, file and imc addresses can be opened");
                 }
                 BROWSERS.with(|m| {
@@ -2386,10 +2446,10 @@ impl Shell {
                 self.eval_ui(&format!("panel(true);section({})", Value::String(sec)));
             }
             // Dev hook (only with IMC_SELFTEST): run script in the active page.
-            "selftest_eval" if std::env::var_os("IMC_SELFTEST").is_some() => self.eval_page(m["js"].as_str().unwrap_or("")),
+            "selftest_eval" if dev("IMC_SELFTEST").is_some() => self.eval_page(m["js"].as_str().unwrap_or("")),
             "site_info" => self.site_info(),
             "site_clear" => self.site_clear(m["kind"].as_str().unwrap_or("")),
-            "selftest_ai_read" if std::env::var_os("IMC_SELFTEST").is_some() => {
+            "selftest_ai_read" if dev("IMC_SELFTEST").is_some() => {
                 BROWSERS.with(|m| {
                     if let Some(f) = m.borrow().get(&AI_ID).and_then(|b| b.main_frame()) {
                         f.execute_java_script(Some(&cs("console.debug('SELFTEST_AI:'+((document.querySelector('textarea')||{}).value||'(nothing)').slice(0,90))")), Some(&cs("imc://selftest")), 0);
@@ -2541,6 +2601,7 @@ impl Shell {
                 } else if self.cfg.ai.url().is_none() {
                     self.toast("Choose an AI site in Settings, AI assistant first.");
                 } else {
+                    self.text_wait = Some((self.w.active, Instant::now()));
                     self.eval_page("window.__imcPageText&&window.__imcPageText()");
                 }
             }
@@ -2875,7 +2936,7 @@ fn cli(args: &[String]) -> bool {
             ];
             for (name, url) in LISTS {
                 let out = config::lists_dir().join(format!("{name}.txt"));
-                let ok = std::process::Command::new("curl.exe").args(["-fsSL", "-o"]).arg(&out).arg(url).status().is_ok_and(|s| s.success());
+                let ok = std::process::Command::new(sandbox::system_exe("curl.exe")).args(["-fsSL", "-o"]).arg(&out).arg(url).status().is_ok_and(|s| s.success());
                 println!("{} {name}", if ok { "updated" } else { "FAILED " });
             }
         }
@@ -2926,6 +2987,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
         return;
     }
     // Everything the browser spawns dies with it, and cannot break away.
+    sandbox::harden_process();
     sandbox::contain_process_tree();
     updater::cleanup();
     defaultbrowser::register();
@@ -2979,6 +3041,9 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
         pop: None,
         pop_rect: None,
         pop_polled: Instant::now(),
+        text_wait: None,
+        rbutton_at: None,
+        ctrl_at: None,
         ai_owner: 0,
         tx: tx.clone(),
         tabs: vec![],
@@ -3037,7 +3102,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
     });
 
     // Dev hook: scripted UI commands so behaviour can be checked without touching the screen.
-    if std::env::var_os("IMC_SELFTEST").is_some() {
+    if dev("IMC_SELFTEST").is_some() {
         let t = tx.clone();
         std::thread::spawn(move || {
             let step = |ms: u64, cmd: &str| {
@@ -3054,7 +3119,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
 
     // Dev hook: run UI commands from a file (one JSON object per line, with an optional "delay" in ms),
     // so the browser can be exercised without touching the screen.
-    if let Some(path) = std::env::var_os("IMC_SELFTEST_IPC") {
+    if let Some(path) = dev("IMC_SELFTEST_IPC") {
         let t = tx.clone();
         std::thread::spawn(move || {
             for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
@@ -3065,7 +3130,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
         });
     }
 
-    if std::env::var_os("IMC_SELFTEST_SITE").is_some() {
+    if dev("IMC_SELFTEST_SITE").is_some() {
         let t3 = tx.clone();
         std::thread::spawn(move || {
             let send = |ms: u64, v: Value| {
@@ -3074,7 +3139,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
             };
             send(6000, json!({"cmd": "selftest_eval", "js": "document.cookie='imc_test=1; path=/'; document.cookie='imc_test2=2; path=/'"}));
             send(1500, json!({"cmd": "site_info"}));
-            let which = std::env::var("IMC_SELFTEST_SITE").unwrap_or_default();
+            let which = dev("IMC_SELFTEST_SITE").map(|v| v.to_string_lossy().into_owned()).unwrap_or_default();
             for kind in ["cookies", "data", "cache"] {
                 if which == "all" || which == kind {
                     send(1500, json!({"cmd": "site_clear", "kind": kind}));
@@ -3082,7 +3147,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
             }
         });
     }
-    if std::env::var_os("IMC_SELFTEST_AI").is_some() {
+    if dev("IMC_SELFTEST_AI").is_some() {
         let t = tx.clone();
         std::thread::spawn(move || {
             let send = |ms: u64, v: Value| {
@@ -3096,7 +3161,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
             let _ = t.send_event(Ev::Ipc(json!({"cmd": "selftest_ai_read"}).to_string()));
         });
     }
-    if let Ok(what) = std::env::var("IMC_SELFTEST_CARD") {
+    if let Some(what) = dev("IMC_SELFTEST_CARD").map(|v| v.to_string_lossy().into_owned()) {
         let t = tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(6));
@@ -3229,11 +3294,14 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
                         state.check_updates(false);
                     }
                 }
+                Ev::Zoom(_) if !state.ctrl_recent() => {}
                 Ev::Zoom(d) => state.zoom_cmd(&d),
                 Ev::Update(m) => state.on_update(m),
                 Ev::Download(e) => state.on_download(e),
                 Ev::Control(r) => state.on_control(r),
-                Ev::PageText { title, url, text, selected } => {
+                // A page that merely prints the right words to its console must not be able to fill the AI box.
+                Ev::PageText { tab, .. } if !state.asked_text(tab) => {}
+                Ev::PageText { tab: _, title, url, text, selected } => {
                     let head = if selected { format!("I selected this text on the page \"{title}\" ({url}):") } else { format!("Here is the page \"{title}\" ({url}):") };
                     let msg = format!("{head}\n\n{text}\n\n");
                     let fresh = !BROWSERS.with(|m| m.borrow().contains_key(&AI_ID));
@@ -3255,11 +3323,12 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
                     }
                 }
                 Ev::Toast(m) => {
-                    if std::env::var_os("IMC_SELFTEST").is_some() {
+                    if dev("IMC_SELFTEST").is_some() {
                         eprintln!("SELFTEST toast {m}");
                     }
                     state.toast(&m)
                 }
+                Ev::Gesture(_) if !state.rbutton_recent() => {}
                 Ev::Gesture(path) => {
                     if state.gesture(&path) {
                         finish();
@@ -3283,6 +3352,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
         }
         state.poll_drag();
         state.poll_popup();
+        state.poll_input();
         if let Some((tab, x, y, w, h)) = state.want_window.take() {
             let window = build_window(target, Some((x, y)), Some((w, h)));
             let id = state.next_win;

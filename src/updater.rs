@@ -126,7 +126,7 @@ pub fn is_newer(m: &Manifest, nightly: bool) -> bool {
 
 fn curl(url: &str, secs: u32) -> Result<Vec<u8>, String> {
     use std::os::windows::process::CommandExt;
-    let out = Command::new("curl.exe")
+    let out = Command::new(crate::sandbox::system_exe("curl.exe"))
         .args(["-fsSL", "--max-time", &secs.to_string(), "-A", "IMC-Browse-updater", url])
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output()

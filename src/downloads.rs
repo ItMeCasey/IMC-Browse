@@ -126,11 +126,11 @@ pub fn open_file(path: &Path) -> bool {
 /// Shows the file selected in Explorer.
 pub fn reveal(path: &Path) {
     use std::os::windows::process::CommandExt;
-    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
+    let _ = std::process::Command::new(crate::sandbox::system_exe("explorer.exe")).raw_arg(format!("/select,\"{}\"", path.display())).spawn();
 }
 
 pub fn open_folder(path: &Path) {
-    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+    let _ = std::process::Command::new(crate::sandbox::system_exe("explorer.exe")).arg(path).spawn();
 }
 
 #[cfg(test)]
