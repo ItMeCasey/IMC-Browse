@@ -1,0 +1,25 @@
+# Opens a pull request when a Rust crate (including the `cef` crate, i.e. a new Chromium) or a
+# GitHub Action has a new version. CI builds and tests each one before you merge it.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /cef
+    schedule:
+      interval: daily
+    groups:
+      cef-rust-minor-and-patch:
+        update-types: [minor, patch]
+        exclude-patterns: [cef, cef-dll-sys]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

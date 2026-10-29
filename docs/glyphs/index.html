@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IMC Browse Glyphs</title>
+<style>
+:root{--bg:#14161a;--bar:#1c1f25;--fg:#e6e8ec;--acc:#4da3ff;--ok:#3ecf8e;--bad:#ff5d5d;--gw:2.75;
+ --dim:color-mix(in srgb,var(--fg),var(--bg) 42%);--line:color-mix(in srgb,var(--bg),var(--fg) 14%);
+ --tab:color-mix(in srgb,var(--bar),var(--fg) 8%)}
+:root[data-theme=light]{--bg:#e9ebef;--bar:#f6f7f9;--fg:#1b1d22;--acc:#1a73e8}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,Segoe UI,sans-serif;padding:24px 20px 60px}
+main{max-width:980px;margin:0 auto}
+h1{margin:0 0 4px;font-size:22px} h2{margin:30px 0 10px;font-size:13px;color:var(--dim);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+p.s{margin:0;color:var(--dim)}
+.g{width:1em;height:1em;display:block;fill:none;stroke:currentColor;stroke-width:var(--gw);stroke-linecap:round;stroke-linejoin:round}
+.ctl{display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin:18px 0;padding:10px 14px;background:var(--bar);border:1px solid var(--line);border-radius:10px}
+.ctl label{display:flex;gap:8px;align-items:center;color:var(--dim)} .ctl b{color:var(--fg);min-width:2.6em;font-variant-numeric:tabular-nums}
+button.t{border:1px solid var(--line);background:var(--tab);color:var(--fg);border-radius:6px;padding:4px 10px;cursor:pointer}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:8px}
+.card{display:flex;flex-direction:column;align-items:center;gap:10px;padding:16px 6px 10px;background:var(--bar);border:1px solid var(--line);border-radius:10px}
+.card span{font-size:11.5px;color:var(--dim)}
+.big{width:32px;height:32px}
+.spin .big{animation:sp 1s linear infinite} @keyframes sp{to{transform:rotate(360deg)}}
+.bar{display:flex;align-items:center;gap:4px;padding:8px 10px;background:var(--bar);border-radius:10px;border:1px solid var(--line);flex-wrap:wrap}
+.b{width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:none;color:var(--dim);cursor:pointer}
+.b:hover{background:color-mix(in srgb,var(--fg),transparent 85%);color:var(--fg)}
+.b.acc{color:var(--acc)} .b.ok{color:var(--ok)} .b.bad{color:var(--bad)}
+.url{flex:1;min-width:160px;height:32px;border-radius:16px;background:var(--tab);display:flex;align-items:center;gap:8px;padding:0 12px;color:var(--dim)}
+.pill{height:28px;padding:0 10px;border-radius:14px;background:var(--tab);display:inline-flex;align-items:center;gap:6px}
+.sizes{display:flex;gap:22px;align-items:flex-end;flex-wrap:wrap;padding:14px;background:var(--bar);border:1px solid var(--line);border-radius:10px}
+.sizes div{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:11px;color:var(--dim)}
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:10px} .cmp .bar{flex-direction:column;align-items:flex-start}
+.cmp small{color:var(--dim)}
+</style></head><body>
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+<!-- IMC Browse glyphs. Use: <svg class="g"><use href="#g-back"/></svg> -->
+  <symbol id="g-back" viewBox="0 0 24 24"><path d="M19.5 12H5M11 5.5 4.5 12l6.5 6.5"/></symbol>
+  <symbol id="g-forward" viewBox="0 0 24 24"><path d="M4.5 12H19M13 5.5l6.5 6.5-6.5 6.5"/></symbol>
+  <symbol id="g-up" viewBox="0 0 24 24"><path d="M12 19.5V5M5.5 11 12 4.5 18.5 11"/></symbol>
+  <symbol id="g-reload" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.35-5.65L20 8.5M20 3.5v5h-5"/></symbol>
+  <symbol id="g-stop" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+  <symbol id="g-home" viewBox="0 0 24 24"><path d="M3.5 11.5 12 4l8.5 7.5M6 10v9.5h12V10M10 19.5v-5h4v5"/></symbol>
+  <symbol id="g-loading" viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 0 8.5 8.5"/></symbol>
+  <symbol id="g-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5l5 5"/></symbol>
+  <symbol id="g-history" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></symbol>
+  <symbol id="g-external" viewBox="0 0 24 24"><path d="M13.5 4.5h6v6M19.5 4.5 11 13M17 14v4.5a1 1 0 0 1-1 1H5.5a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1H10"/></symbol>
+  <symbol id="g-menu" viewBox="0 0 24 24"><path d="M4.5 6.5h15M4.5 12h15M4.5 17.5h15"/></symbol>
+  <symbol id="g-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.9" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.9" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.9" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="g-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="g-close" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+  <symbol id="g-check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></symbol>
+  <symbol id="g-chev-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="g-chev-up" viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></symbol>
+  <symbol id="g-chev-left" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="g-chev-right" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="g-star" viewBox="0 0 24 24"><path d="M12 3.5l2.6 5.5 6 .8-4.4 4.2 1.1 6-5.3-2.9-5.3 2.9 1.1-6L3.4 9.8l6-.8z"/></symbol>
+  <symbol id="g-star-fill" viewBox="0 0 24 24"><path d="M12 3.5l2.6 5.5 6 .8-4.4 4.2 1.1 6-5.3-2.9-5.3 2.9 1.1-6L3.4 9.8l6-.8z" fill="currentColor"/></symbol>
+  <symbol id="g-bookmarks" viewBox="0 0 24 24"><path d="M6.5 4.5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v16l-5.5-4-5.5 4z"/></symbol>
+  <symbol id="g-sidebar" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3.5"/><path d="M9.5 4.5v15"/></symbol>
+  <symbol id="g-engine" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="5"/><circle cx="11" cy="11" r="3.6"/><path d="M14 14l3 3"/></symbol>
+  <symbol id="g-sliders" viewBox="0 0 24 24"><path d="M4 7h8.5M17.5 7H20M4 17h2.5M11.5 17H20"/><circle cx="15" cy="7" r="2.5"/><circle cx="9" cy="17" r="2.5"/></symbol>
+  <symbol id="g-theme" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor"/></symbol>
+  <symbol id="g-extension" viewBox="0 0 24 24"><path d="M4 8.5a1 1 0 0 1 1-1h3.5v-1a2.25 2.25 0 0 1 4.5 0v1h3.5a1 1 0 0 1 1 1V11h1a2.25 2.25 0 0 1 0 4.5h-1v4a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/></symbol>
+  <symbol id="g-shield" viewBox="0 0 24 24"><path d="M12 3.5 19.5 6.5v5.5c0 4.5-3.2 7.5-7.5 9-4.3-1.5-7.5-4.5-7.5-9V6.5z"/></symbol>
+  <symbol id="g-shield-ok" viewBox="0 0 24 24"><path d="M12 3.5 19.5 6.5v5.5c0 4.5-3.2 7.5-7.5 9-4.3-1.5-7.5-4.5-7.5-9V6.5z"/><path d="M8.8 12l2.4 2.4 4-4.4"/></symbol>
+  <symbol id="g-shield-off" viewBox="0 0 24 24"><path d="M12 3.5 19.5 6.5v5.5c0 4.5-3.2 7.5-7.5 9-4.3-1.5-7.5-4.5-7.5-9V6.5z"/><path d="M4.5 4.5l15 15"/></symbol>
+  <symbol id="g-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="3"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/><circle cx="12" cy="15.5" r="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-unlock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="3"/><path d="M8 10.5V8a4 4 0 0 1 7.6-1.7"/><circle cx="12" cy="15.5" r="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-ghost" viewBox="0 0 24 24"><path d="M12 3.5a6.5 6.5 0 0 0-6.5 6.5v10.5l3.25-2.2L12 20.5l3.25-2.2 3.25 2.2V10A6.5 6.5 0 0 0 12 3.5z"/><circle cx="9.5" cy="10.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="14.5" cy="10.5" r="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><ellipse cx="12" cy="12" rx="3.6" ry="8.5"/></symbol>
+  <symbol id="g-globe-off" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><ellipse cx="12" cy="12" rx="3.6" ry="8.5"/><path d="M4.5 4.5l15 15"/></symbol>
+  <symbol id="g-power" viewBox="0 0 24 24"><path d="M12 3.5v8.5M7 6.5a7.5 7.5 0 1 0 10 0"/></symbol>
+  <symbol id="g-key" viewBox="0 0 24 24"><circle cx="7.5" cy="16.5" r="3.5"/><path d="M10 14 20 4M16 8l3 3"/></symbol>
+  <symbol id="g-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.6"/></symbol>
+  <symbol id="g-eye-off" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.6"/><path d="M4.5 4.5l15 15"/></symbol>
+  <symbol id="g-block" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></symbol>
+  <symbol id="g-sound" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5l5 4v-13l-5 4z" fill="currentColor"/><path d="M16.5 9a4 4 0 0 1 0 6M19.5 6.5a8 8 0 0 1 0 11"/></symbol>
+  <symbol id="g-mute" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5l5 4v-13l-5 4z" fill="currentColor"/><path d="M16.5 9.5l5 5M21.5 9.5l-5 5"/></symbol>
+  <symbol id="g-sleep" viewBox="0 0 24 24"><path d="M5 11h8l-8 9h8M15 3.5h5l-5 6h5"/></symbol>
+  <symbol id="g-tab-new" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3.5"/><path d="M12 9v6M9 12h6"/></symbol>
+  <symbol id="g-camera" viewBox="0 0 24 24"><path d="M3.5 8.5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2zM15.5 11l5-3v8l-5-3z"/></symbol>
+  <symbol id="g-mic" viewBox="0 0 24 24"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v2.5"/></symbol>
+  <symbol id="g-pin" viewBox="0 0 24 24"><path d="M12 21s-6.5-5.8-6.5-11a6.5 6.5 0 0 1 13 0c0 5.2-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></symbol>
+  <symbol id="g-bell" viewBox="0 0 24 24"><path d="M6 17.5V11a6 6 0 0 1 12 0v6.5M4.5 17.5h15M10 21h4"/></symbol>
+  <symbol id="g-folder" viewBox="0 0 24 24"><path d="M3.5 18.5v-11A1.5 1.5 0 0 1 5 6h4.2l2 2.5H19a1.5 1.5 0 0 1 1.5 1.5v8.5A1.5 1.5 0 0 1 19 20H5a1.5 1.5 0 0 1-1.5-1.5z"/></symbol>
+  <symbol id="g-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="g-upload" viewBox="0 0 24 24"><path d="M12 15V4M7 8.5l5-5 5 5M5 20h14"/></symbol>
+  <symbol id="g-enter" viewBox="0 0 24 24"><path d="M14 4.5h4.5A1.5 1.5 0 0 1 20 6v12a1.5 1.5 0 0 1-1.5 1.5H14M4 12h11M10.5 7.5 15 12l-4.5 4.5"/></symbol>
+  <symbol id="g-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></symbol>
+  <symbol id="g-edit" viewBox="0 0 24 24"><path d="M4.5 19.5l1-4.5L16 4.5a2.1 2.1 0 0 1 3 3L8.5 18z"/></symbol>
+  <symbol id="g-trash" viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5"/></symbol>
+  <symbol id="g-zoom-in" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5l5 5"/><path d="M8 10.5h5M10.5 8v5"/></symbol>
+  <symbol id="g-zoom-out" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5l5 5"/><path d="M8 10.5h5"/></symbol>
+  <symbol id="g-pin-tab" viewBox="0 0 24 24"><path d="M9 4.5h6M10 4.5v5L7 13h10l-3-3.5v-5M12 13v7"/></symbol>
+  <symbol id="g-undo" viewBox="0 0 24 24"><path d="M4.5 9h10a5 5 0 0 1 0 10H9M8.5 4.5 4 9l4.5 4.5"/></symbol>
+  <symbol id="g-tabs" viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="17" height="13" rx="3"/><path d="M7.5 4h9"/></symbol>
+  <symbol id="g-window" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3.5"/><path d="M3.5 9.5h17"/></symbol>
+  <symbol id="g-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.5"/><path d="M4.5 20.5a7.5 7 0 0 1 15 0"/></symbol>
+  <symbol id="g-grip" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.5" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-win-min" viewBox="0 0 24 24"><path d="M5.5 18h13"/></symbol>
+  <symbol id="g-win-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2.5"/></symbol>
+  <symbol id="g-win-restore" viewBox="0 0 24 24"><path d="M9 8.5V7a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-1.5"/><rect x="5" y="9" width="10.5" height="10.5" rx="2"/></symbol>
+  <symbol id="g-fullscreen" viewBox="0 0 24 24"><path d="M4.5 9V5.5a1 1 0 0 1 1-1H9M15 4.5h3.5a1 1 0 0 1 1 1V9M19.5 15v3.5a1 1 0 0 1-1 1H15M9 19.5H5.5a1 1 0 0 1-1-1V15"/></symbol>
+  <symbol id="g-print" viewBox="0 0 24 24"><path d="M7 8.5V4.5h10v4M7 17H5.5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1h13a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H17M7 14h10v6H7z"/></symbol>
+  <symbol id="g-share" viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></symbol>
+  <symbol id="g-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></symbol>
+  <symbol id="g-reader" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="3"/><path d="M9 9h6M9 13h6M9 17h3"/></symbol>
+  <symbol id="g-screenshot" viewBox="0 0 24 24"><path d="M4.5 8V6.5a2 2 0 0 1 2-2H8M16 4.5h1.5a2 2 0 0 1 2 2V8M19.5 16v1.5a2 2 0 0 1-2 2H16M8 19.5H6.5a2 2 0 0 1-2-2V16"/><circle cx="12" cy="12" r="2.5"/></symbol>
+  <symbol id="g-pip" viewBox="0 0 24 24"><rect x="3.5" y="5.5" width="17" height="13" rx="3"/><rect x="12" y="11.5" width="6" height="4.5" rx="1" fill="currentColor"/></symbol>
+  <symbol id="g-code" viewBox="0 0 24 24"><path d="M8.5 7 3.5 12l5 5M15.5 7l5 5-5 5"/></symbol>
+  <symbol id="g-image" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M4 17l5-5 4 4 2.5-2.5 4.5 4.5"/><circle cx="15.5" cy="9.5" r="1.4" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-cookie" viewBox="0 0 24 24"><path d="M20.5 12.5A8.5 8.5 0 1 1 11.5 3.5a3.5 3.5 0 0 0 4 4 3 3 0 0 0 5 5z"/><circle cx="9" cy="10" r="1.2" fill="currentColor" stroke="none"/><circle cx="10" cy="15.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="15" cy="16" r="1.2" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-wifi" viewBox="0 0 24 24"><path d="M3.5 9.5a12.5 12.5 0 0 1 17 0M6.5 13a8 8 0 0 1 11 0M9.5 16.2a3.6 3.6 0 0 1 5 0"/><circle cx="12" cy="19.5" r="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-wifi-off" viewBox="0 0 24 24"><path d="M3.5 9.5a12.5 12.5 0 0 1 17 0M6.5 13a8 8 0 0 1 11 0M9.5 16.2a3.6 3.6 0 0 1 5 0"/><circle cx="12" cy="19.5" r="1.5" fill="currentColor" stroke="none"/><path d="M4.5 4.5l15 15"/></symbol>
+  <symbol id="g-page-error" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="3"/><path d="M9.5 9.5l5 5M14.5 9.5l-5 5"/></symbol>
+  <symbol id="g-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5"/><circle cx="12" cy="7.8" r="1.4" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-warning" viewBox="0 0 24 24"><path d="M12 3.8 21 19.5H3z"/><path d="M12 10v3.5"/><circle cx="12" cy="16.6" r="1.2" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="g-ok" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8 12.3l2.8 2.8 5.2-5.6"/></symbol>
+  <symbol id="g-error" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+</svg>
+
+<main>
+<h1>IMC Browse Glyphs</h1>
+<p class="s">84 glyphs, 24 grid, round caps, one weight. Weight is the CSS variable <code>--gw</code>.</p>
+
+<div class="ctl">
+ <label>Weight <input id="w" type="range" min="1.5" max="3.75" step="0.05" value="2.75"><b id="wv">2.75</b></label>
+ <label>Size <input id="z" type="range" min="12" max="48" step="1" value="32"><b id="zv">32</b></label>
+ <button class="t" id="th">Light / dark</button>
+</div>
+
+<h2>In the toolbar (actual size: 18px)</h2>
+<div class="bar">
+ <button class="b " title="back"><svg class="g" style="width:18px;height:18px"><use href="#g-back"/></svg></button><button class="b " title="forward"><svg class="g" style="width:18px;height:18px"><use href="#g-forward"/></svg></button><button class="b " title="reload"><svg class="g" style="width:18px;height:18px"><use href="#g-reload"/></svg></button>
+ <div class="url"><svg class="g" style="width:15px;height:15px;color:var(--ok)"><use href="#g-lock"/></svg>example.com/page</div>
+ <button class="b acc" title="star"><svg class="g" style="width:18px;height:18px"><use href="#g-star"/></svg></button><button class="b " title="search"><svg class="g" style="width:18px;height:18px"><use href="#g-search"/></svg></button>
+ <span class="pill" style="color:var(--ok)"><svg class="g" style="width:16px;height:16px"><use href="#g-shield-ok"/></svg>142</span>
+ <span class="pill" style="color:var(--dim)"><svg class="g" style="width:16px;height:16px"><use href="#g-globe-off"/></svg>VPN off</span>
+ <span class="pill" style="color:var(--bad)"><svg class="g" style="width:16px;height:16px"><use href="#g-globe-off"/></svg>VPN down</span>
+ <button class="b " title="menu"><svg class="g" style="width:18px;height:18px"><use href="#g-menu"/></svg></button>
+</div>
+<div class="bar" style="margin-top:8px">
+ <span class="pill"><svg class="g" style="width:15px;height:15px;color:#9b7bff"><use href="#g-ghost"/></svg>Ghost tab<svg class="g" style="width:14px;height:14px"><use href="#g-close"/></svg></span>
+ <span class="pill"><svg class="g" style="width:15px;height:15px;color:var(--acc)"><use href="#g-sound"/></svg>Playing<svg class="g" style="width:14px;height:14px"><use href="#g-close"/></svg></span>
+ <span class="pill"><svg class="g" style="width:15px;height:15px"><use href="#g-mute"/></svg>Muted<svg class="g" style="width:14px;height:14px"><use href="#g-close"/></svg></span>
+ <span class="pill"><svg class="g" style="width:15px;height:15px;color:var(--acc)"><use href="#g-sleep"/></svg>Hibernating</span>
+ <button class="b " title="plus"><svg class="g" style="width:18px;height:18px"><use href="#g-plus"/></svg></button>
+</div>
+
+<h2>Old pack (2.0) vs this pack (2.75) at 15px and 18px</h2>
+<div class="cmp">
+ <div class="bar"><small>2.0</small><div style="display:flex;gap:6px">
+  <svg class="g" style="--gw:2;width:15px;height:15px"><use href="#g-sound"/></svg><svg class="g" style="--gw:2;width:15px;height:15px"><use href="#g-mute"/></svg><svg class="g" style="--gw:2;width:15px;height:15px"><use href="#g-star"/></svg><svg class="g" style="--gw:2;width:15px;height:15px"><use href="#g-back"/></svg><svg class="g" style="--gw:2;width:15px;height:15px"><use href="#g-close"/></svg><svg class="g" style="--gw:2;width:18px;height:18px"><use href="#g-sound"/></svg><svg class="g" style="--gw:2;width:18px;height:18px"><use href="#g-mute"/></svg><svg class="g" style="--gw:2;width:18px;height:18px"><use href="#g-star"/></svg><svg class="g" style="--gw:2;width:18px;height:18px"><use href="#g-back"/></svg><svg class="g" style="--gw:2;width:18px;height:18px"><use href="#g-close"/></svg></div></div>
+ <div class="bar"><small>2.75</small><div style="display:flex;gap:6px">
+  <svg class="g" style="width:15px;height:15px"><use href="#g-sound"/></svg><svg class="g" style="width:15px;height:15px"><use href="#g-mute"/></svg><svg class="g" style="width:15px;height:15px"><use href="#g-star"/></svg><svg class="g" style="width:15px;height:15px"><use href="#g-back"/></svg><svg class="g" style="width:15px;height:15px"><use href="#g-close"/></svg><svg class="g" style="width:18px;height:18px"><use href="#g-sound"/></svg><svg class="g" style="width:18px;height:18px"><use href="#g-mute"/></svg><svg class="g" style="width:18px;height:18px"><use href="#g-star"/></svg><svg class="g" style="width:18px;height:18px"><use href="#g-back"/></svg><svg class="g" style="width:18px;height:18px"><use href="#g-close"/></svg></div></div>
+</div>
+
+<h2>Sizes</h2>
+<div class="sizes"><div><svg class="g" style="width:12px;height:12px"><use href="#g-ghost"/></svg>12</div><div><svg class="g" style="width:14px;height:14px"><use href="#g-ghost"/></svg>14</div><div><svg class="g" style="width:16px;height:16px"><use href="#g-ghost"/></svg>16</div><div><svg class="g" style="width:18px;height:18px"><use href="#g-ghost"/></svg>18</div><div><svg class="g" style="width:20px;height:20px"><use href="#g-ghost"/></svg>20</div><div><svg class="g" style="width:24px;height:24px"><use href="#g-ghost"/></svg>24</div><div><svg class="g" style="width:32px;height:32px"><use href="#g-ghost"/></svg>32</div><div><svg class="g" style="width:48px;height:48px"><use href="#g-ghost"/></svg>48</div></div>
+
+<h2>Navigation</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-back"/></svg><span>back</span></div><div class="card"><svg class="g big"><use href="#g-forward"/></svg><span>forward</span></div><div class="card"><svg class="g big"><use href="#g-up"/></svg><span>up</span></div><div class="card"><svg class="g big"><use href="#g-reload"/></svg><span>reload</span></div><div class="card"><svg class="g big"><use href="#g-stop"/></svg><span>stop</span></div><div class="card"><svg class="g big"><use href="#g-home"/></svg><span>home</span></div><div class="card spin"><svg class="g big"><use href="#g-loading"/></svg><span>loading</span></div><div class="card"><svg class="g big"><use href="#g-search"/></svg><span>search</span></div><div class="card"><svg class="g big"><use href="#g-history"/></svg><span>history</span></div><div class="card"><svg class="g big"><use href="#g-external"/></svg><span>external</span></div></div><h2>Toolbar and tabs</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-menu"/></svg><span>menu</span></div><div class="card"><svg class="g big"><use href="#g-more"/></svg><span>more</span></div><div class="card"><svg class="g big"><use href="#g-plus"/></svg><span>plus</span></div><div class="card"><svg class="g big"><use href="#g-minus"/></svg><span>minus</span></div><div class="card"><svg class="g big"><use href="#g-close"/></svg><span>close</span></div><div class="card"><svg class="g big"><use href="#g-check"/></svg><span>check</span></div><div class="card"><svg class="g big"><use href="#g-chev-down"/></svg><span>chev-down</span></div><div class="card"><svg class="g big"><use href="#g-chev-up"/></svg><span>chev-up</span></div><div class="card"><svg class="g big"><use href="#g-chev-left"/></svg><span>chev-left</span></div><div class="card"><svg class="g big"><use href="#g-chev-right"/></svg><span>chev-right</span></div><div class="card"><svg class="g big"><use href="#g-star"/></svg><span>star</span></div><div class="card"><svg class="g big"><use href="#g-star-fill"/></svg><span>star-fill</span></div><div class="card"><svg class="g big"><use href="#g-bookmarks"/></svg><span>bookmarks</span></div><div class="card"><svg class="g big"><use href="#g-sidebar"/></svg><span>sidebar</span></div><div class="card"><svg class="g big"><use href="#g-engine"/></svg><span>engine</span></div><div class="card"><svg class="g big"><use href="#g-sliders"/></svg><span>sliders</span></div><div class="card"><svg class="g big"><use href="#g-theme"/></svg><span>theme</span></div><div class="card"><svg class="g big"><use href="#g-extension"/></svg><span>extension</span></div></div><h2>Security and privacy</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-shield"/></svg><span>shield</span></div><div class="card"><svg class="g big"><use href="#g-shield-ok"/></svg><span>shield-ok</span></div><div class="card"><svg class="g big"><use href="#g-shield-off"/></svg><span>shield-off</span></div><div class="card"><svg class="g big"><use href="#g-lock"/></svg><span>lock</span></div><div class="card"><svg class="g big"><use href="#g-unlock"/></svg><span>unlock</span></div><div class="card"><svg class="g big"><use href="#g-ghost"/></svg><span>ghost</span></div><div class="card"><svg class="g big"><use href="#g-globe"/></svg><span>globe</span></div><div class="card"><svg class="g big"><use href="#g-globe-off"/></svg><span>globe-off</span></div><div class="card"><svg class="g big"><use href="#g-power"/></svg><span>power</span></div><div class="card"><svg class="g big"><use href="#g-key"/></svg><span>key</span></div><div class="card"><svg class="g big"><use href="#g-eye"/></svg><span>eye</span></div><div class="card"><svg class="g big"><use href="#g-eye-off"/></svg><span>eye-off</span></div><div class="card"><svg class="g big"><use href="#g-block"/></svg><span>block</span></div></div><h2>Media and tab state</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-sound"/></svg><span>sound</span></div><div class="card"><svg class="g big"><use href="#g-mute"/></svg><span>mute</span></div><div class="card"><svg class="g big"><use href="#g-sleep"/></svg><span>sleep</span></div><div class="card"><svg class="g big"><use href="#g-tab-new"/></svg><span>tab-new</span></div><div class="card"><svg class="g big"><use href="#g-camera"/></svg><span>camera</span></div><div class="card"><svg class="g big"><use href="#g-mic"/></svg><span>mic</span></div><div class="card"><svg class="g big"><use href="#g-pin"/></svg><span>pin</span></div><div class="card"><svg class="g big"><use href="#g-bell"/></svg><span>bell</span></div></div><h2>Panel and data</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-folder"/></svg><span>folder</span></div><div class="card"><svg class="g big"><use href="#g-download"/></svg><span>download</span></div><div class="card"><svg class="g big"><use href="#g-upload"/></svg><span>upload</span></div><div class="card"><svg class="g big"><use href="#g-enter"/></svg><span>enter</span></div><div class="card"><svg class="g big"><use href="#g-copy"/></svg><span>copy</span></div><div class="card"><svg class="g big"><use href="#g-edit"/></svg><span>edit</span></div><div class="card"><svg class="g big"><use href="#g-trash"/></svg><span>trash</span></div><div class="card"><svg class="g big"><use href="#g-zoom-in"/></svg><span>zoom-in</span></div><div class="card"><svg class="g big"><use href="#g-zoom-out"/></svg><span>zoom-out</span></div></div><h2>Tabs and window</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-pin-tab"/></svg><span>pin-tab</span></div><div class="card"><svg class="g big"><use href="#g-undo"/></svg><span>undo</span></div><div class="card"><svg class="g big"><use href="#g-tabs"/></svg><span>tabs</span></div><div class="card"><svg class="g big"><use href="#g-window"/></svg><span>window</span></div><div class="card"><svg class="g big"><use href="#g-user"/></svg><span>user</span></div><div class="card"><svg class="g big"><use href="#g-grip"/></svg><span>grip</span></div><div class="card"><svg class="g big"><use href="#g-win-min"/></svg><span>win-min</span></div><div class="card"><svg class="g big"><use href="#g-win-max"/></svg><span>win-max</span></div><div class="card"><svg class="g big"><use href="#g-win-restore"/></svg><span>win-restore</span></div></div><h2>Page actions</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-fullscreen"/></svg><span>fullscreen</span></div><div class="card"><svg class="g big"><use href="#g-print"/></svg><span>print</span></div><div class="card"><svg class="g big"><use href="#g-share"/></svg><span>share</span></div><div class="card"><svg class="g big"><use href="#g-link"/></svg><span>link</span></div><div class="card"><svg class="g big"><use href="#g-reader"/></svg><span>reader</span></div><div class="card"><svg class="g big"><use href="#g-screenshot"/></svg><span>screenshot</span></div><div class="card"><svg class="g big"><use href="#g-pip"/></svg><span>pip</span></div><div class="card"><svg class="g big"><use href="#g-code"/></svg><span>code</span></div><div class="card"><svg class="g big"><use href="#g-image"/></svg><span>image</span></div></div><h2>Network and errors</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-cookie"/></svg><span>cookie</span></div><div class="card"><svg class="g big"><use href="#g-wifi"/></svg><span>wifi</span></div><div class="card"><svg class="g big"><use href="#g-wifi-off"/></svg><span>wifi-off</span></div><div class="card"><svg class="g big"><use href="#g-page-error"/></svg><span>page-error</span></div></div><h2>Status</h2><div class="grid"><div class="card"><svg class="g big"><use href="#g-info"/></svg><span>info</span></div><div class="card"><svg class="g big"><use href="#g-warning"/></svg><span>warning</span></div><div class="card"><svg class="g big"><use href="#g-ok"/></svg><span>ok</span></div><div class="card"><svg class="g big"><use href="#g-error"/></svg><span>error</span></div></div>
+</main>
+<script>
+const r=document.documentElement,$=id=>document.getElementById(id);
+$('w').oninput=e=>{r.style.setProperty('--gw',e.target.value);$('wv').textContent=e.target.value};
+$('z').oninput=e=>{document.querySelectorAll('.big').forEach(g=>g.style.cssText='width:'+e.target.value+'px;height:'+e.target.value+'px');$('zv').textContent=e.target.value};
+$('th').onclick=()=>{r.dataset.theme=r.dataset.theme==='light'?'dark':'light'};
+</script></body></html>
