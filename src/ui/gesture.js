@@ -128,3 +128,22 @@
     el.style.borderRadius = near ? '8px 0 0 0' : '0 8px 0 0';
   }, true);
 })();
+
+// Page icon: the engine does not announce it for these windows, so find <link rel="icon"> here and
+// report the url (the host downloads it through the tab's own network context).
+(() => {
+  if (window.__imcF || window.top !== window) return;
+  window.__imcF = 1;
+  let last = '';
+  const find = () => {
+    const links = [...document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"]')];
+    const pick = links.find((l) => /(^|\s)(32|48|64)x/.test((l.sizes && l.sizes.value) || '')) || links.find((l) => !l.sizes || !l.sizes.value) || links[0];
+    const u = pick ? pick.href : (/^https?:$/.test(location.protocol) ? location.origin + '/favicon.ico' : '');
+    if (u && u !== last) { last = u; console.debug('IMCFAV:' + u); }
+  };
+  addEventListener('DOMContentLoaded', () => {
+    find();
+    if (document.head) new MutationObserver(find).observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'rel'] });
+  });
+  addEventListener('load', find);
+})();

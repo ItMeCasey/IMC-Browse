@@ -66,6 +66,10 @@ enum Ev {
     Audio(usize, bool),
     /// A drawn gesture path (U/D/L/R) reported by a page.
     Gesture(String),
+    /// A page announced its icon(s); we fetch the first.
+    FaviconUrl(usize, String),
+    /// The icon, as a ready-to-show data: URI (tab id, icon url).
+    Favicon(usize, String, String),
     Download(DlEvent),
     Toast(String),
     Update(updater::UpdMsg),
@@ -143,6 +147,17 @@ wrap_display_handler! {
                 }
             }
         }
+        fn on_favicon_urlchange(&self, _b: Option<&mut Browser>, urls: Option<&mut CefStringList>) {
+            if self.id == UI_ID {
+                return;
+            }
+            if let Some(first) = urls.cloned().and_then(|l| l.into_iter().next()) {
+                if std::env::var_os("IMC_SELFTEST").is_some() {
+                    eprintln!("SELFTEST favicon url tab {} {}", self.id, first);
+                }
+                let _ = self.tx.send_event(Ev::FaviconUrl(self.id, first.to_string()));
+            }
+        }
         fn on_title_change(&self, _b: Option<&mut Browser>, title: Option<&CefString>) {
             if self.id != UI_ID {
                 if let Some(t) = title {
@@ -154,6 +169,10 @@ wrap_display_handler! {
         fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, _s: Option<&CefString>, _line: i32) -> i32 {
             if self.id != UI_ID {
                 if let Some(m) = msg.map(|m| m.to_string()) {
+                    if let Some(u) = m.strip_prefix("IMCFAV:") {
+                        let _ = self.tx.send_event(Ev::FaviconUrl(self.id, u.to_string()));
+                        return 1;
+                    }
                     if let Some(d) = m.strip_prefix("IMCZOOM:").filter(|d| ["in", "out", "reset"].contains(d)) {
                         let _ = self.tx.send_event(Ev::Zoom(d.to_string()));
                         return 1;
@@ -520,6 +539,47 @@ wrap_completion_callback! {
     }
 }
 
+fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len() * 4 / 3 + 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+// A downloaded favicon, re-encoded as PNG and handed to the UI as a data: URI.
+wrap_download_image_callback! {
+    struct FavDone {
+        tab: usize,
+        url: String,
+        tx: EventLoopProxy<Ev>,
+    }
+    impl DownloadImageCallback {
+        fn on_download_image_finished(&self, _url: Option<&CefString>, status: i32, image: Option<&mut Image>) {
+            if std::env::var_os("IMC_SELFTEST").is_some() {
+                eprintln!("SELFTEST favicon downloaded tab {} status {} image {}", self.tab, status, image.is_some());
+            }
+            if !(200..300).contains(&status) {
+                return;
+            }
+            let Some(image) = image else { return };
+            let (mut w, mut h) = (0, 0);
+            let Some(png) = image.as_png(1.0, 1, Some(&mut w), Some(&mut h)) else { return };
+            let mut buf = vec![0u8; png.size()];
+            png.data(Some(&mut buf), 0);
+            if buf.is_empty() || buf.len() > 64 * 1024 {
+                return;
+            }
+            let _ = self.tx.send_event(Ev::Favicon(self.tab, self.url.clone(), format!("data:image/png;base64,{}", b64(&buf))));
+        }
+    }
+}
+
 wrap_client! {
     struct Cl {
         id: usize,
@@ -635,6 +695,9 @@ struct Tab {
     frozen: bool,
     /// Current zoom factor (1.0 = 100%).
     zoom: f64,
+    /// The page's icon (data: URI) and the url it came from.
+    favicon: Option<String>,
+    fav_url: String,
     last_active: Instant,
 }
 
@@ -734,7 +797,7 @@ impl Shell {
         let id = self.next;
         self.next += 1;
         self.spawn(id, url, private);
-        self.tabs.push(Tab { id, url: url.into(), title: String::new(), loading: true, audible: false, muted: false, private, frozen: false, zoom: 1.0, last_active: Instant::now() });
+        self.tabs.push(Tab { id, url: url.into(), title: String::new(), loading: true, audible: false, muted: false, private, frozen: false, zoom: 1.0, favicon: None, fav_url: String::new(), last_active: Instant::now() });
         id
     }
 
@@ -764,7 +827,7 @@ impl Shell {
             }
         }
         if std::env::var_os("IMC_SELFTEST").is_some() {
-            let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}|{}|{}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.active { "*" } else { "" }, t.url, t.title)).collect();
+            let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}|{}|{}|fav={}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.active { "*" } else { "" }, t.url, t.title, t.favicon.as_ref().map(|f| f.len()).unwrap_or(0))).collect();
             eprintln!("SELFTEST tabs [{}] ghost_ctx={}", sum.join(" "), self.ghost_ctx.is_some());
             eprintln!("SELFTEST downloads {:?}", self.downloads.iter().map(|d| (d.name.clone(), d.state.clone(), d.received, d.total, d.path.clone())).collect::<Vec<_>>());
         }
@@ -1037,6 +1100,22 @@ impl Shell {
         }
     }
 
+    /// Downloads a page's icon through that tab's own network context (so blocking, proxy and Ghost isolation apply).
+    fn fetch_favicon(&mut self, id: usize, url: String) {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) else { return };
+        if t.fav_url == url || !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:")) {
+            return;
+        }
+        t.fav_url = url.clone();
+        let tx = self.tx.clone();
+        BROWSERS.with(|m| {
+            if let Some(h) = m.borrow().get(&id).and_then(|b| b.host()) {
+                let mut cb = FavDone::new(id, url.clone(), tx);
+                h.download_image(Some(&cs(&url)), 1, 32, 0, Some(&mut cb));
+            }
+        });
+    }
+
     fn on_download(&mut self, e: DlEvent) {
         let now = updater::now_unix();
         let mut progress_only = false;
@@ -1238,7 +1317,7 @@ impl Shell {
             return;
         }
         let state = json!({
-            "tabs": self.tabs.iter().map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "frozen": t.frozen, "loading": t.loading, "audible": t.audible, "muted": t.muted, "private": t.private, "zoom": (t.zoom * 100.0).round()})).collect::<Vec<_>>(),
+            "tabs": self.tabs.iter().map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "frozen": t.frozen, "loading": t.loading, "audible": t.audible, "muted": t.muted, "private": t.private, "zoom": (t.zoom * 100.0).round(), "favicon": t.favicon})).collect::<Vec<_>>(),
             "active": self.active,
             "bookmarks": self.bookmarks,
             "blocked": self.shield.blocked.load(Ordering::Relaxed),
@@ -1857,7 +1936,12 @@ fn main() {
                 }
                 Ev::Url(id, u) => {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id && !t.frozen) {
-                        t.url = if u.starts_with("imc://") { u.trim_end_matches('/').to_string() } else { u };
+                        let new = if u.starts_with("imc://") { u.trim_end_matches('/').to_string() } else { u };
+                        if host_of(&new) != host_of(&t.url) {
+                            t.favicon = None;
+                            t.fav_url.clear();
+                        }
+                        t.url = new;
                     }
                     state.apply_zoom(id);
                     state.push();
@@ -1889,6 +1973,13 @@ fn main() {
                 Ev::Zoom(d) => state.zoom_cmd(&d),
                 Ev::Update(m) => state.on_update(m),
                 Ev::Download(e) => state.on_download(e),
+                Ev::FaviconUrl(id, url) => state.fetch_favicon(id, url),
+                Ev::Favicon(id, url, data) => {
+                    if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id && t.fav_url == url) {
+                        t.favicon = Some(data);
+                        state.push();
+                    }
+                }
                 Ev::Toast(m) => {
                     if std::env::var_os("IMC_SELFTEST").is_some() {
                         eprintln!("SELFTEST toast {m}");
