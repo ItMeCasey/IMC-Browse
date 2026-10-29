@@ -7,6 +7,8 @@
 mod adblock;
 mod bookmarks;
 mod config;
+mod downloads;
+mod sandbox;
 mod updater;
 mod vpn;
 
@@ -18,7 +20,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -45,6 +47,13 @@ const SIDEBAR_W: f64 = 230.0;
 const TITLEBAR_H: f64 = 32.0;
 const UI_ID: usize = 0;
 
+/// Download progress, as reported by CEF's download handler.
+pub enum DlEvent {
+    Started { id: u64, name: String, path: String, url: String, total: i64, private: bool },
+    Progress { id: u64, received: i64, total: i64 },
+    State { id: u64, state: &'static str },
+}
+
 enum Ev {
     Ipc(String),
     Url(usize, String),
@@ -54,6 +63,7 @@ enum Ev {
     Audio(usize, bool),
     /// A drawn gesture path (U/D/L/R) reported by a page.
     Gesture(String),
+    Download(DlEvent),
     Update(updater::UpdMsg),
     /// Zoom request from a page: "in", "out" or "reset".
     Zoom(String),
@@ -309,11 +319,85 @@ wrap_permission_handler! {
     }
 }
 
+thread_local! {
+    /// CEF's per-session item id -> our id (CEF ids restart at 1 every launch; ours do not).
+    static DL_ITEMS: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
+    /// Running downloads, kept so they can be cancelled.
+    static DL_CBS: RefCell<HashMap<u64, DownloadItemCallback>> = RefCell::new(HashMap::new());
+}
+
+fn cancel_download(id: u64) {
+    DL_CBS.with(|m| {
+        if let Some(cb) = m.borrow().get(&id) {
+            cb.cancel();
+        }
+    });
+}
+
+// Downloads go straight to the system Downloads folder (no dialog) and are tracked in our list.
+wrap_download_handler! {
+    struct Dl {
+        tx: EventLoopProxy<Ev>,
+        private: bool,
+        ids: Arc<AtomicU64>,
+    }
+    impl DownloadHandler {
+        fn can_download(&self, _b: Option<&mut Browser>, _url: Option<&CefString>, _method: Option<&CefString>) -> i32 {
+            1
+        }
+        fn on_before_download(&self, _b: Option<&mut Browser>, item: Option<&mut DownloadItem>, suggested: Option<&CefString>, cb: Option<&mut BeforeDownloadCallback>) -> i32 {
+            let (Some(item), Some(cb)) = (item, cb) else { return 0 };
+            let name = downloads::sanitize_name(&suggested.map(|s| s.to_string()).unwrap_or_default());
+            let path = downloads::unique_path(&downloads::dir(), &name);
+            let id = self.ids.fetch_add(1, Ordering::Relaxed);
+            DL_ITEMS.with(|m| m.borrow_mut().insert(item.id(), id));
+            cb.cont(Some(&cs(&path.to_string_lossy())), 0);
+            let _ = self.tx.send_event(Ev::Download(DlEvent::Started {
+                id,
+                name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name),
+                path: path.display().to_string(),
+                url: CefString::from(&item.url()).to_string(),
+                total: item.total_bytes(),
+                private: self.private,
+            }));
+            1
+        }
+        fn on_download_updated(&self, _b: Option<&mut Browser>, item: Option<&mut DownloadItem>, cb: Option<&mut DownloadItemCallback>) {
+            let Some(item) = item else { return };
+            let Some(id) = DL_ITEMS.with(|m| m.borrow().get(&item.id()).copied()) else { return };
+            let state = if item.is_complete() != 0 {
+                Some("done")
+            } else if item.is_canceled() != 0 {
+                Some("canceled")
+            } else if item.is_interrupted() != 0 {
+                Some("failed")
+            } else {
+                None
+            };
+            match state {
+                Some(state) => {
+                    DL_CBS.with(|m| m.borrow_mut().remove(&id));
+                    DL_ITEMS.with(|m| m.borrow_mut().remove(&item.id()));
+                    let _ = self.tx.send_event(Ev::Download(DlEvent::State { id, state }));
+                }
+                None => {
+                    if let Some(cb) = cb {
+                        DL_CBS.with(|m| m.borrow_mut().insert(id, cb.clone()));
+                    }
+                    let _ = self.tx.send_event(Ev::Download(DlEvent::Progress { id, received: item.received_bytes(), total: item.total_bytes() }));
+                }
+            }
+        }
+    }
+}
+
 wrap_client! {
     struct Cl {
         id: usize,
         tx: EventLoopProxy<Ev>,
         shield: Option<Arc<Shield>>,
+        private: bool,
+        dl_ids: Arc<AtomicU64>,
     }
     impl Client {
         fn display_handler(&self) -> Option<DisplayHandler> {
@@ -327,6 +411,9 @@ wrap_client! {
         }
         fn request_handler(&self) -> Option<RequestHandler> {
             self.shield.clone().map(Req::new)
+        }
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            (self.id != UI_ID).then(|| Dl::new(self.tx.clone(), self.private, self.dl_ids.clone()))
         }
         fn permission_handler(&self) -> Option<PermissionHandler> {
             Some(Perm::new())
@@ -432,6 +519,9 @@ struct Shell {
     /// URLs of recently closed tabs (not Ghost), newest last.
     closed: Vec<String>,
     upd: updater::Ctl,
+    downloads: Vec<downloads::Item>,
+    dl_ids: Arc<AtomicU64>,
+    last_dl_push: Instant,
 }
 
 fn host_hwnd(id: usize) -> Option<HWND> {
@@ -477,7 +567,7 @@ impl Shell {
     fn spawn(&mut self, id: usize, url: &str, private: bool) -> bool {
         let r = self.content_rect();
         let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(sys::HWND(self.window.hwnd() as *mut _), &r);
-        let mut client = Cl::new(id, self.tx.clone(), Some(self.shield.clone()));
+        let mut client = Cl::new(id, self.tx.clone(), Some(self.shield.clone()), private, self.dl_ids.clone());
         let mut ctx = if private {
             if self.ghost_ctx.is_none() {
                 // Empty cache_path = nothing touches the disk.
@@ -536,6 +626,7 @@ impl Shell {
         if std::env::var_os("IMC_SELFTEST").is_some() {
             let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.active { "*" } else { "" })).collect();
             eprintln!("SELFTEST tabs [{}] ghost_ctx={}", sum.join(" "), self.ghost_ctx.is_some());
+            eprintln!("SELFTEST downloads {:?}", self.downloads.iter().map(|d| (d.name.clone(), d.state.clone(), d.received, d.total, d.path.clone())).collect::<Vec<_>>());
         }
         self.push();
     }
@@ -726,6 +817,63 @@ impl Shell {
             self.upd.start_install(send);
         }
         self.push_update();
+    }
+
+    fn on_download(&mut self, e: DlEvent) {
+        let now = updater::now_unix();
+        let mut progress_only = false;
+        match e {
+            DlEvent::Started { id, name, path, url, total, private } => {
+                self.toast(&format!("Downloading {name}"));
+                self.downloads.push(downloads::Item { id, name, path, url, total, received: 0, state: "progress".into(), started: now, private });
+            }
+            DlEvent::Progress { id, received, total } => {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+                    d.received = received;
+                    d.total = total;
+                }
+                progress_only = true;
+            }
+            DlEvent::State { id, state } => {
+                let mut msg = None;
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+                    d.state = state.into();
+                    if state == "done" {
+                        d.received = d.total.max(d.received);
+                        downloads::mark_of_the_web(std::path::Path::new(&d.path), &d.url);
+                        msg = Some(format!("Downloaded {}", d.name));
+                    } else if state == "failed" {
+                        msg = Some(format!("Download failed: {}", d.name));
+                    }
+                }
+                if let Some(m) = msg {
+                    self.toast(&m);
+                }
+                downloads::save(&self.downloads);
+            }
+        }
+        // progress ticks arrive many times a second; keep the UI to about five updates
+        if progress_only && self.last_dl_push.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        self.last_dl_push = Instant::now();
+        self.push_downloads(false);
+    }
+
+    /// Recent downloads for the UI (`open` also opens the popup).
+    fn push_downloads(&self, open: bool) {
+        let list: Vec<Value> = self
+            .downloads
+            .iter()
+            .rev()
+            .take(30)
+            .map(|d| {
+                let p = std::path::Path::new(&d.path);
+                json!({"id": d.id, "name": d.name, "state": d.state, "received": d.received, "total": d.total, "started": d.started,
+                       "exists": d.state != "done" || p.is_file(), "risky": downloads::is_risky(&d.name), "private": d.private})
+            })
+            .collect();
+        self.eval_ui(&format!("window.ui.downloads({},{open})", Value::Array(list)));
     }
 
     fn eval_page(&self, js: &str) {
@@ -975,6 +1123,42 @@ impl Shell {
                     self.toast("Secure DNS saved. Restart the browser to apply it.");
                 }
             }
+            "dl_list" => self.push_downloads(true),
+            "dl_open" | "dl_show" | "dl_cancel" | "dl_remove" => {
+                let id = m["id"].as_u64().unwrap_or(0);
+                let Some(i) = self.downloads.iter().position(|d| d.id == id) else { return false };
+                let path = std::path::PathBuf::from(&self.downloads[i].path);
+                match m["cmd"].as_str().unwrap_or("") {
+                    "dl_open" => {
+                        if self.downloads[i].state == "done" && downloads::inside_downloads(&path) {
+                            if !downloads::open_file(&path) {
+                                self.toast("Windows could not open that file.");
+                            }
+                        } else {
+                            self.toast("That file is no longer in your Downloads folder.");
+                        }
+                    }
+                    "dl_show" => {
+                        if path.is_file() {
+                            downloads::reveal(&path);
+                        } else {
+                            downloads::open_folder(&downloads::dir());
+                        }
+                    }
+                    "dl_cancel" => cancel_download(id),
+                    _ => {
+                        self.downloads.remove(i);
+                        downloads::save(&self.downloads);
+                        self.push_downloads(false);
+                    }
+                }
+            }
+            "dl_clear" => {
+                self.downloads.retain(|d| d.state == "progress");
+                downloads::save(&self.downloads);
+                self.push_downloads(false);
+            }
+            "dl_folder" => downloads::open_folder(&downloads::dir()),
             "update_state" => self.push_update(),
             "update_prefs" => {
                 self.cfg.update.auto = m["auto"].as_bool().unwrap_or(false);
@@ -1083,21 +1267,61 @@ fn finish() {
     shutdown();
 }
 
+/// Command-line tools (run instead of starting the browser): `imc-browse --help` lists them.
+fn cli(args: &[String]) -> bool {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    let Some(first) = args.first() else { return false };
+    if !["--update-lists", "--version", "--help"].contains(&first.as_str()) {
+        return false; // anything else is a Chromium switch or a page to open
+    }
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+    match first.as_str() {
+        "--version" => println!("IMC Browse {} (build {})", updater::VERSION, updater::BUILD_ID),
+        "--update-lists" => {
+            const LISTS: &[(&str, &str)] = &[
+                ("easylist", "https://easylist.to/easylist/easylist.txt"),
+                ("easyprivacy", "https://easylist.to/easylist/easyprivacy.txt"),
+                ("ublock-filters", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"),
+                ("ublock-privacy", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt"),
+                ("ublock-badware", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt"),
+            ];
+            for (name, url) in LISTS {
+                let out = config::lists_dir().join(format!("{name}.txt"));
+                let ok = std::process::Command::new("curl.exe").args(["-fsSL", "-o"]).arg(&out).arg(url).status().is_ok_and(|s| s.success());
+                println!("{} {name}", if ok { "updated" } else { "FAILED " });
+            }
+        }
+        _ => println!("imc-browse [URL...]
+  --update-lists   download the ad and tracker filter lists
+  --version"),
+    }
+    true
+}
+
 fn main() {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
 
     // Renderer/GPU/utility subprocesses are this same exe: they run here and return.
     let cfg = Config::load();
-    updater::cleanup();
-    // Secure DNS lives in the engine's Local State file; set it before the engine starts.
-    config::write_secure_dns(&config::root().join("cef-profile"), &cfg.doh);
     let mut app = ImcApp::new(cfg.vpn.clone(), cfg.gestures.page_config(), cfg.hardware_acceleration);
     let code = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
     if code >= 0 {
         std::process::exit(code);
     }
 
+    // From here on this is the browser process (not a renderer/GPU/utility child).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if cli(&argv) {
+        return;
+    }
+    // Everything the browser spawns dies with it, and cannot break away.
+    sandbox::contain_process_tree();
+    updater::cleanup();
+    // Secure DNS lives in the engine's Local State file; set it before the engine starts.
+    config::write_secure_dns(&config::root().join("cef-profile"), &cfg.doh);
     vpn::start_watchdog(cfg.vpn.clone());
     let cache = cs(&config::root().join("cef-profile").to_string_lossy());
     let settings = Settings { no_sandbox: 1, root_cache_path: cache.clone(), cache_path: cache, ..Default::default() };
@@ -1124,7 +1348,7 @@ fn main() {
         sys::HWND(window.hwnd() as *mut _),
         &Rect { x: 0, y: 0, width: size.width as i32, height: size.height as i32 },
     );
-    let mut ui_client = Cl::new(UI_ID, tx.clone(), None);
+    let mut ui_client = Cl::new(UI_ID, tx.clone(), None, false, Arc::new(AtomicU64::new(0)));
     let ui = browser_host_create_browser_sync(Some(&info), Some(&mut ui_client), Some(&cs(&ui_url)), Some(&BrowserSettings::default()), None, None)
         .expect("chrome ui");
     BROWSERS.with(|m| m.borrow_mut().insert(UI_ID, ui));
@@ -1140,6 +1364,7 @@ fn main() {
         )
     };
     let shield = Arc::new(Shield { engine, css_js, enabled: AtomicBool::new(cfg.adblock), blocked: AtomicUsize::new(0), kill_switch: cfg.vpn.enabled && cfg.vpn.kill_switch, gest: std::sync::RwLock::new(cfg.gestures.page_config()) });
+    let downloads = downloads::load();
     let mut state = Shell {
         window,
         tx: tx.clone(),
@@ -1154,6 +1379,9 @@ fn main() {
         ghost_ctx: None,
         closed: vec![],
         upd: updater::Ctl::new(),
+        dl_ids: Arc::new(AtomicU64::new(downloads.iter().map(|d| d.id).max().unwrap_or(0) + 1)),
+        downloads,
+        last_dl_push: Instant::now(),
     };
     let mut urls: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(|a| normalize(&a, &cfg.search_engine)).collect();
     let session = config::root().join("session.json");
@@ -1249,6 +1477,7 @@ fn main() {
                 }
                 Ev::Zoom(d) => state.zoom_cmd(&d),
                 Ev::Update(m) => state.on_update(m),
+                Ev::Download(e) => state.on_download(e),
                 Ev::Gesture(path) => {
                     if state.gesture(&path) {
                         finish();
