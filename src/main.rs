@@ -6,8 +6,10 @@
 
 mod adblock;
 mod bookmarks;
+mod cards;
 mod config;
 mod downloads;
+mod passwords;
 mod internal;
 mod sandbox;
 mod updater;
@@ -1092,6 +1094,93 @@ impl Shell {
         self.eval_ui(&format!("window.ui.downloads({},{open})", Value::Array(list)));
     }
 
+    fn push_cards(&self) {
+        let list: Vec<Value> = cards::load()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| json!({"i": i, "label": c.label, "name": c.name, "brand": c.brand, "last4": c.last4, "month": c.exp_month, "year": c.exp_year}))
+            .collect();
+        let _ = self.eval_ui_ret(&format!("window.ui.cardsList({})", Value::Array(list)));
+    }
+
+    /// Fill only on an explicit click, only on an HTTPS page, only the main frame's matching fields.
+    fn fill_card(&self, i: usize) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        if !tab.url.starts_with("https://") {
+            self.toast("Not filled: card details are only filled on HTTPS pages.");
+            return;
+        }
+        let list = cards::load();
+        let Some(card) = list.get(i) else { return };
+        let Some(num) = cards::number(card) else {
+            self.toast("This card could not be decrypted (it was saved under another Windows account).");
+            return;
+        };
+        let js = format!(
+            "(function(num,name,mm,yyyy){{const set=(e,v)=>{{const P=e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;\
+             Object.getOwnPropertyDescriptor(P,'value').set.call(e,v);e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}))}};\
+             const find=(ac,rx)=>document.querySelector('[autocomplete~=\"'+ac+'\"]')||[...document.querySelectorAll('input,select')].find(e=>e.type!=='hidden'&&rx.test([e.name,e.id,e.getAttribute('aria-label'),e.placeholder].join(' ')));\
+             const pick=(e,vals)=>{{if(!e)return;if(e.tagName==='SELECT'){{const o=[...e.options].find(o=>vals.includes(o.value)||vals.includes(o.text.trim()));if(o)set(e,o.value)}}else set(e,vals[0])}};\
+             pick(find('cc-number',/card.?n|cc.?num|number/i),[num]);pick(find('cc-name',/card.?holder|name.?on|cc.?name/i),[name]);\
+             const m=find('cc-exp-month',/exp.*month|month/i),y=find('cc-exp-year',/exp.*year|year/i),exp=find('cc-exp',/exp|mm.?.?yy/i);\
+             pick(m,[mm,String(+mm)]);pick(y,[yyyy,yyyy.slice(2)]);\
+             if(exp&&exp!==m&&exp!==y)pick(exp,[mm+'/'+yyyy.slice(2),mm+' / '+yyyy.slice(2),mm+yyyy.slice(2)])}})({},{},{},{})",
+            Value::String(num),
+            Value::String(card.name.clone()),
+            Value::String(format!("{:02}", card.exp_month)),
+            Value::String(card.exp_year.to_string())
+        );
+        self.eval_page(&js);
+        self.toast(&format!("Filled {} ending {}. Enter the security code yourself.", card.brand, card.last4));
+    }
+
+    fn toast(&self, msg: &str) {
+        let _ = self.eval_ui_ret(&format!("window.ui.toast({})", Value::String(msg.into())));
+    }
+
+    /// Credential list without secrets; `match` flags entries for the active site.
+    fn push_creds(&self) {
+        let active_host = self.tabs.iter().find(|t| t.id == self.active).map(|t| passwords::host(&t.url)).unwrap_or_default();
+        let list: Vec<Value> = passwords::load()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let h = passwords::host(&c.url);
+                let hit = !active_host.is_empty() && adblock::registrable(&h) == adblock::registrable(&active_host);
+                json!({"i": i, "url": c.url, "host": h, "username": c.username, "match": hit})
+            })
+            .collect();
+        let _ = self.eval_ui_ret(&format!("window.ui.creds({})", Value::Array(list)));
+    }
+
+    /// Fill only on explicit click, only over HTTPS, only on the saved site's own domain.
+    fn fill_password(&self, i: usize) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == self.active) else { return };
+        let c = passwords::load();
+        let Some(cred) = c.get(i) else { return };
+        let same = adblock::registrable(&passwords::host(&cred.url)) == adblock::registrable(&passwords::host(&tab.url));
+        if !tab.url.starts_with("https://") || !same {
+            self.toast("Not filled: the open page is not an HTTPS page on this login's site.");
+            return;
+        }
+        let Some(pw) = passwords::decrypt(&cred.enc) else { return };
+        let js = format!(
+            "(function(u,p){{const ins=[...document.querySelectorAll('input')],pw=ins.find(e=>e.type==='password');if(!pw)return;\
+             const us=ins.slice(0,ins.indexOf(pw)).reverse().find(e=>['text','email','tel'].includes(e.type||'text'));\
+             const set=(e,v)=>{{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\
+             e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}))}};\
+             if(us)set(us,u);set(pw,p)}})({},{})",
+            Value::String(cred.username.clone()),
+            Value::String(pw)
+        );
+        self.eval_page(&js);
+        self.toast("Filled.");
+    }
+
+    fn eval_ui_ret(&self, js: &str) {
+        self.eval_ui(js);
+    }
+
     fn eval_page(&self, js: &str) {
         self.with_active(|b| {
             if let Some(f) = b.main_frame() {
@@ -1161,10 +1250,6 @@ impl Shell {
             "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
         });
         self.eval_ui(&format!("window.ui&&window.ui.set({state})"));
-    }
-
-    fn toast(&self, msg: &str) {
-        self.eval_ui(&format!("window.ui.toast({})", Value::String(msg.into())));
     }
 
     /// Returns true when the app should restart/quit.
@@ -1462,6 +1547,77 @@ impl Shell {
                     return true;
                 }
             }
+            "import_bookmarks" => {
+                let found = bookmarks::parse_auto(m["text"].as_str().unwrap_or(""));
+                let (total, added) = (found.len(), bookmarks::merge(&mut self.bookmarks, found));
+                bookmarks::save(&self.bookmarks);
+                self.toast(&format!("Bookmarks: {added} imported, {} duplicates/invalid skipped", total - added));
+                self.push();
+            }
+            "import_browsers" => {
+                let mut report = vec![];
+                for (name, path) in bookmarks::browser_files() {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    let found = bookmarks::parse_auto(&text);
+                    report.push(format!("{name}: {}", bookmarks::merge(&mut self.bookmarks, found)));
+                }
+                bookmarks::save(&self.bookmarks);
+                self.toast(&if report.is_empty() {
+                    "No Chrome/Edge/Brave/Vivaldi profile found. Export bookmarks as HTML and import the file.".to_string()
+                } else {
+                    format!("Imported bookmarks - {}", report.join(", "))
+                });
+                self.push();
+            }
+            "creds" => self.push_creds(),
+            "import_passwords" => {
+                let mut c = passwords::load();
+                match passwords::import_csv(&mut c, m["text"].as_str().unwrap_or("")) {
+                    Ok((ok, skip)) => {
+                        passwords::save(&c);
+                        self.toast(&format!("Passwords: {ok} imported and encrypted, {skip} skipped. Delete the CSV file now: it is plaintext."));
+                    }
+                    Err(e) => self.toast(&format!("Password import failed: {e}")),
+                }
+                self.push_creds();
+            }
+            "pw_delete" => {
+                let mut c = passwords::load();
+                if let Some(i) = m["i"].as_u64().map(|i| i as usize).filter(|&i| i < c.len()) {
+                    c.remove(i);
+                    passwords::save(&c);
+                }
+                self.push_creds();
+            }
+            "pw_reveal" => {
+                let c = passwords::load();
+                if let Some(pw) = m["i"].as_u64().and_then(|i| c.get(i as usize)).and_then(|c| passwords::decrypt(&c.enc)) {
+                    self.eval_ui(&format!("window.ui.revealed({},{})", m["i"], Value::String(pw)));
+                }
+            }
+            "pw_fill" => self.fill_password(m["i"].as_u64().unwrap_or(u64::MAX) as usize),
+            "cards" => self.push_cards(),
+            "card_add" => {
+                let mut list = cards::load();
+                let (month, year) = (m["month"].as_u64().unwrap_or(0) as u8, m["year"].as_u64().unwrap_or(0) as u16);
+                match cards::add(&mut list, m["label"].as_str().unwrap_or(""), m["name"].as_str().unwrap_or(""), m["number"].as_str().unwrap_or(""), month, year) {
+                    Ok(what) => {
+                        cards::save(&list);
+                        self.toast(&format!("Saved {what}. The number is encrypted; the security code is never stored."));
+                    }
+                    Err(e) => self.toast(&e),
+                }
+                self.push_cards();
+            }
+            "card_delete" => {
+                let mut list = cards::load();
+                if let Some(i) = m["i"].as_u64().map(|i| i as usize).filter(|&i| i < list.len()) {
+                    list.remove(i);
+                    cards::save(&list);
+                }
+                self.push_cards();
+            }
+            "card_fill" => self.fill_card(m["i"].as_u64().unwrap_or(u64::MAX) as usize),
             other => self.toast(&format!("'{other}' is not in the CEF build yet.")),
         }
         false
@@ -1665,6 +1821,18 @@ fn main() {
                     send(1500, json!({"cmd": "site_clear", "kind": kind}));
                 }
             }
+        });
+    }
+    if let Ok(what) = std::env::var("IMC_SELFTEST_CARD") {
+        let t = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            let msg = if what == "add" {
+                json!({"cmd": "card_add", "label": "", "name": "Test Person", "number": "4111 1111 1111 1111", "month": 12, "year": 2031})
+            } else {
+                json!({"cmd": "card_delete", "i": 0})
+            };
+            let _ = t.send_event(Ev::Ipc(msg.to_string()));
         });
     }
     event_loop.run(move |event, _, flow| {
