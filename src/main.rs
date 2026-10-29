@@ -1,144 +1,450 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! IMC Browse on CEF (Chromium 156). The tao window owns the frame; the chrome UI and every tab are
+//! CEF child windows, laid out exactly like the WebView2 build. Single-threaded: CEF is pumped from
+//! the tao loop, so every CEF callback runs on the main thread.
+//!
+//! The Windows sandbox is off until the bootstrap launcher is set up.
 
 mod adblock;
 mod bookmarks;
-mod cards;
-mod passwords;
 mod config;
-mod downloads;
-mod ext;
-mod internal;
 mod updater;
-mod sandbox;
 mod vpn;
-mod winhook;
 
+use cef::*;
 use config::Config;
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
-    process::Command,
+    cell::RefCell,
+    collections::HashMap,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 use tao::{
-    dpi::{LogicalPosition, LogicalSize},
+    dpi::LogicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    platform::windows::WindowExtWindows,
     window::{Fullscreen, Window, WindowBuilder},
 };
-use winhook::{DlEvent, Shield};
-use wry::{
-    NewWindowResponse, PageLoadEvent, PermissionKind, PermissionResponse, Rect, WebContext, WebView, WebViewBuilder,
-    WebViewBuilderExtWindows, WebViewExtWindows,
+use windows::Win32::{
+    Foundation::HWND,
+    UI::WindowsAndMessaging::{HWND_TOP, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, DestroyWindow, SetWindowPos},
 };
 
-const TOOLBAR_H: f64 = 52.0;
-const TABSTRIP_H: f64 = 36.0;
-const SIDEBAR_W: f64 = 230.0;
-/// Own title row, only needed with vertical tabs (otherwise the tab strip is the titlebar).
-const TITLEBAR_H: f64 = 32.0;
 /// Which download this build updates itself from (see the release manifest).
-const FLAVOR: &str = "webview2";
+const FLAVOR: &str = "cef";
 const CHROME_HTML: &str = include_str!("ui/chrome.html");
 /// Injected into every page: right-button drag recognition (see ui/gesture.js).
 const GESTURE_JS: &str = include_str!("ui/gesture.js");
-
-/// Everything the OS/Chromium would otherwise phone home with, plus GPU raster and strict site isolation.
-const BASE_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,OptimizationHints,MediaRouter,Translate,AutofillServerCommunication \
---disable-background-networking --disable-sync --disable-component-update --disable-domain-reliability \
---disable-client-side-phishing-detection --disable-breakpad --no-pings --no-first-run";
-
-/// GPU flags follow the Hardware acceleration setting.
-fn gpu_args(on: bool) -> &'static str {
-    if on { " --enable-gpu-rasterization --enable-zero-copy" } else { " --disable-gpu --disable-gpu-compositing" }
-}
+const TOOLBAR_H: f64 = 52.0;
+const TABSTRIP_H: f64 = 36.0;
+const SIDEBAR_W: f64 = 230.0;
+const TITLEBAR_H: f64 = 32.0;
+const UI_ID: usize = 0;
 
 enum Ev {
     Ipc(String),
     Url(usize, String),
     Title(usize, String),
     Load(usize, bool),
-    Audio(usize, bool),
-    Go(usize, String),
     Open(String),
+    Audio(usize, bool),
     /// A drawn gesture path (U/D/L/R) reported by a page.
     Gesture(String),
     Update(updater::UpdMsg),
-    Download(DlEvent),
     /// Zoom request from a page: "in", "out" or "reset".
     Zoom(String),
-    /// Certificate/connection JSON for a tab (DevTools Security domain).
-    Security(usize, String),
-    Toast(String),
     Tick,
-    /// (id, name) pairs WebView2 reports for installed extensions.
-    ExtIds(Vec<(String, String)>),
+    /// A browser finished closing (safe to release anything it was using).
+    Closed,
 }
 
-struct Tab {
-    id: usize,
-    wv: WebView,
-    url: String,
-    title: String,
-    loading: bool,
-    frozen: bool,
-    audible: bool,
-    muted: bool,
-    /// Ghost tab: throwaway profile, no extensions, never saved or restored.
-    private: bool,
-    /// Current zoom factor (1.0 = 100%).
-    zoom: f64,
-    last_active: Instant,
+thread_local! {
+    /// Browser objects are not Send, so they stay on the main thread: id -> browser (0 is the chrome UI).
+    static BROWSERS: RefCell<HashMap<usize, Browser>> = RefCell::new(HashMap::new());
 }
 
-struct App {
-    window: Window,
-    chrome: WebView,
-    ctx: WebContext,
-    /// Created with the first Ghost tab, dropped and deleted with the last one.
-    private_ctx: Option<WebContext>,
-    tabs: Vec<Tab>,
-    active: usize,
-    next: usize,
-    cfg: Config,
-    proxy: EventLoopProxy<Ev>,
-    shield: Arc<Shield>,
-    insecure_ok: Arc<Mutex<HashSet<String>>>,
-    args: String,
-    panel: bool,
-    bookmarks: Vec<bookmarks::Bookmark>,
-    /// URLs of recently closed tabs (not Ghost), newest last.
-    closed: Vec<String>,
-    ext_items: Vec<ext::Item>,
-    ext_ids: Vec<(String, String)>,
-    sec: std::collections::HashMap<usize, String>,
-    /// Live data behind the imc:// pages.
-    internal: Arc<RwLock<internal::Internal>>,
-    downloads: Vec<downloads::Item>,
-    dl_ids: Arc<std::sync::atomic::AtomicU64>,
-    last_dl_push: Instant,
-    upd: updater::Ctl,
+/// Request filter shared with CEF's IO thread.
+struct Shield {
+    engine: adblock::Engine,
+    css_js: String,
+    enabled: AtomicBool,
+    blocked: AtomicUsize,
+    kill_switch: bool,
+    /// Page-side gesture config JSON (ui/gesture.js); kept current when the user edits gestures.
+    gest: std::sync::RwLock<String>,
 }
 
-/// Page area. The chrome webview spans the whole window underneath; pages are child
-/// windows on top, so the chrome only shows where they don't cover it (toolbar, tab strip/sidebar).
-fn content_bounds(w: &Window, hidden: bool, vertical: bool) -> Rect {
-    let s: LogicalSize<f64> = w.inner_size().to_logical(w.scale_factor());
-    let (left, top) = if vertical { (SIDEBAR_W, TITLEBAR_H + TOOLBAR_H) } else { (0.0, TOOLBAR_H + TABSTRIP_H) };
-    let (cw, ch) = if hidden { (0.0, 0.0) } else { ((s.width - left).max(0.0), (s.height - top).max(0.0)) };
-    Rect { position: LogicalPosition::new(left, top).into(), size: LogicalSize::new(cw, ch).into() }
+fn load_engine() -> adblock::Engine {
+    let mut e = adblock::Engine::new();
+    e.load_list(include_str!("../data/builtin.txt"));
+    if let Ok(rd) = std::fs::read_dir(config::lists_dir()) {
+        for f in rd.flatten() {
+            if f.path().extension().is_some_and(|x| x == "txt") {
+                if let Ok(t) = std::fs::read_to_string(f.path()) {
+                    e.load_list(&t);
+                }
+            }
+        }
+    }
+    e
 }
 
 fn host_of(u: &str) -> &str {
     u.split("://").nth(1).and_then(|r| r.split(['/', '?', '#', ':']).next()).unwrap_or("")
 }
 
-fn is_local(h: &str) -> bool {
-    h == "localhost" || h.ends_with(".localhost") || h == "127.0.0.1" || h == "[::1]"
+fn kind_of(rt: &ResourceType) -> u16 {
+    if *rt == ResourceType::MAIN_FRAME { adblock::T_DOC }
+    else if *rt == ResourceType::SUB_FRAME { adblock::T_SUBDOC }
+    else if *rt == ResourceType::STYLESHEET { adblock::T_STYLE }
+    else if *rt == ResourceType::SCRIPT { adblock::T_SCRIPT }
+    else if *rt == ResourceType::IMAGE { adblock::T_IMAGE }
+    else if *rt == ResourceType::FONT_RESOURCE { adblock::T_FONT }
+    else if *rt == ResourceType::MEDIA { adblock::T_MEDIA }
+    else if *rt == ResourceType::XHR { adblock::T_XHR }
+    else if *rt == ResourceType::PING { adblock::T_PING }
+    else { adblock::T_OTHER }
+}
+
+fn cs(s: &str) -> CefString {
+    CefString::from(s)
+}
+
+// ---- CEF handlers -------------------------------------------------------------------------
+
+wrap_display_handler! {
+    struct Disp {
+        id: usize,
+        tx: EventLoopProxy<Ev>,
+    }
+    impl DisplayHandler {
+        fn on_address_change(&self, _b: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
+            if self.id != UI_ID && frame.is_some_and(|f| f.is_main() != 0) {
+                if let Some(u) = url {
+                    let _ = self.tx.send_event(Ev::Url(self.id, u.to_string()));
+                }
+            }
+        }
+        fn on_title_change(&self, _b: Option<&mut Browser>, title: Option<&CefString>) {
+            if self.id != UI_ID {
+                if let Some(t) = title {
+                    let _ = self.tx.send_event(Ev::Title(self.id, t.to_string()));
+                }
+            }
+        }
+        // The chrome UI talks to Rust through console lines; only the UI's own client reads them.
+        fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, _s: Option<&CefString>, _line: i32) -> i32 {
+            if self.id != UI_ID {
+                if let Some(m) = msg.map(|m| m.to_string()) {
+                    if let Some(d) = m.strip_prefix("IMCZOOM:").filter(|d| ["in", "out", "reset"].contains(d)) {
+                        let _ = self.tx.send_event(Ev::Zoom(d.to_string()));
+                        return 1;
+                    }
+                    if let Some(p) = m.strip_prefix("IMCGESTURE:").and_then(config::Gestures::clean_path) {
+                        let _ = self.tx.send_event(Ev::Gesture(p));
+                        return 1;
+                    }
+                    if let Some(v) = m.strip_prefix("IMCAUDIO:") {
+                        let _ = self.tx.send_event(Ev::Audio(self.id, v == "1"));
+                        return 1;
+                    }
+                }
+            }
+            if self.id == UI_ID {
+                if let Some(m) = msg.map(|m| m.to_string()) {
+                    if let Some(body) = m.strip_prefix("IMCIPC:") {
+                        let _ = self.tx.send_event(Ev::Ipc(body.to_string()));
+                        return 1;
+                    }
+                }
+            }
+            0
+        }
+    }
+}
+
+wrap_load_handler! {
+    struct Load {
+        id: usize,
+        tx: EventLoopProxy<Ev>,
+        shield: Option<Arc<Shield>>,
+    }
+    impl LoadHandler {
+        // Generic cosmetic filters (no init-script hook in CEF, so this runs after load).
+        fn on_load_end(&self, _b: Option<&mut Browser>, frame: Option<&mut Frame>, _status: i32) {
+            if let (Some(sh), Some(f)) = (&self.shield, frame) {
+                if f.is_main() != 0 {
+                    if sh.enabled.load(Ordering::Relaxed) && !sh.css_js.is_empty() {
+                        f.execute_java_script(Some(&cs(&sh.css_js)), Some(&cs("imc://cosmetic")), 0);
+                    }
+                    let g = format!("window.__imcGset&&window.__imcGset({})", sh.gest.read().unwrap());
+                    f.execute_java_script(Some(&cs(&g)), Some(&cs("imc://gestures")), 0);
+                }
+            }
+        }
+        fn on_loading_state_change(&self, _b: Option<&mut Browser>, is_loading: i32, _back: i32, _fwd: i32) {
+            if self.id != UI_ID {
+                let _ = self.tx.send_event(Ev::Load(self.id, is_loading != 0));
+            }
+        }
+    }
+}
+
+wrap_life_span_handler! {
+    struct Life {
+        tx: EventLoopProxy<Ev>,
+    }
+    impl LifeSpanHandler {
+        // Default (false) makes CEF send WM_CLOSE to the top-level owner, which is the whole app window.
+        // Tabs are children of it, so we take over: returning true lets CEF tear down just this page.
+        fn do_close(&self, b: Option<&mut Browser>) -> i32 {
+            // Destroy only this page's window; CEF then finishes teardown and calls on_before_close.
+            if let Some(h) = b.and_then(|b| b.host()) {
+                unsafe {
+                    let _ = DestroyWindow(HWND(h.window_handle().0 as *mut _));
+                }
+            }
+            1
+        }
+        fn on_before_close(&self, _b: Option<&mut Browser>) {
+            let _ = self.tx.send_event(Ev::Closed);
+        }
+        // Pop-ups and target=_blank become new tabs.
+        fn on_before_popup(
+            &self,
+            _b: Option<&mut Browser>,
+            _f: Option<&mut Frame>,
+            _popup_id: i32,
+            target_url: Option<&CefString>,
+            _name: Option<&CefString>,
+            _disp: WindowOpenDisposition,
+            _gesture: i32,
+            _features: Option<&PopupFeatures>,
+            _wi: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra: Option<&mut Option<DictionaryValue>>,
+            _nojs: Option<&mut i32>,
+        ) -> i32 {
+            if let Some(u) = target_url {
+                let _ = self.tx.send_event(Ev::Open(u.to_string()));
+            }
+            1
+        }
+    }
+}
+
+// Cancels a request the filter already decided to block.
+wrap_resource_request_handler! {
+    struct Cancel;
+    impl ResourceRequestHandler {
+        fn on_before_resource_load(&self, _b: Option<&mut Browser>, _f: Option<&mut Frame>, _r: Option<&mut Request>, _cb: Option<&mut Callback>) -> ReturnValue {
+            ReturnValue::CANCEL
+        }
+    }
+}
+
+wrap_request_handler! {
+    struct Req {
+        shield: Arc<Shield>,
+    }
+    impl RequestHandler {
+        // IO thread, once per request: decide here so allowed requests cost no allocation.
+        fn resource_request_handler(
+            &self,
+            _b: Option<&mut Browser>,
+            _f: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _nav: i32,
+            _dl: i32,
+            initiator: Option<&CefString>,
+            _disable: Option<&mut i32>,
+        ) -> Option<ResourceRequestHandler> {
+            let down = self.shield.kill_switch && vpn::TUNNEL_DOWN.load(Ordering::Relaxed);
+            if !down && !self.shield.enabled.load(Ordering::Relaxed) {
+                return None;
+            }
+            let request = request?;
+            let url = CefString::from(&request.url()).to_string();
+            if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("ws")) {
+                return None;
+            }
+            let host = host_of(&url);
+            let local = host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || host == "[::1]";
+            // Kill switch: fail closed while the proxy endpoint is unreachable.
+            if down && !local {
+                return Some(Cancel::new());
+            }
+            let kind = kind_of(&request.resource_type());
+            if kind == adblock::T_DOC {
+                return None;
+            }
+            let source = initiator.map(|i| i.to_string()).unwrap_or_default();
+            let hit = self.shield.engine.should_block(&adblock::Request { url: &url, source_host: host_of(&source), kind });
+            if hit {
+                self.shield.blocked.fetch_add(1, Ordering::Relaxed);
+                Some(Cancel::new())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+// Zero ambient authority: pages never get camera, microphone, location, etc.
+wrap_permission_handler! {
+    struct Perm;
+    impl PermissionHandler {
+        fn on_request_media_access_permission(&self, _b: Option<&mut Browser>, _f: Option<&mut Frame>, _o: Option<&CefString>, _p: u32, _cb: Option<&mut MediaAccessCallback>) -> i32 {
+            0
+        }
+        // Alloy default handling for an unanswered prompt is deny.
+        fn on_show_permission_prompt(&self, _b: Option<&mut Browser>, _id: u64, _o: Option<&CefString>, _p: u32, _cb: Option<&mut PermissionPromptCallback>) -> i32 {
+            0
+        }
+    }
+}
+
+wrap_client! {
+    struct Cl {
+        id: usize,
+        tx: EventLoopProxy<Ev>,
+        shield: Option<Arc<Shield>>,
+    }
+    impl Client {
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(Disp::new(self.id, self.tx.clone()))
+        }
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(Load::new(self.id, self.tx.clone(), self.shield.clone()))
+        }
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
+            Some(Life::new(self.tx.clone()))
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            self.shield.clone().map(Req::new)
+        }
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(Perm::new())
+        }
+    }
+}
+
+/// Runs at document start in every page, before the page's own scripts. Reports "is this tab
+/// making sound" without touching playback (CEF's audio-capture hook silenced it).
+const AUDIO_PROBE: &str = r#"(()=>{if(window.__imcA)return;window.__imcA=1;let last=-1;const ctxs=new Set();
+const AC=window.AudioContext||window.webkitAudioContext;
+if(AC){const W=class extends AC{constructor(...a){super(...a);ctxs.add(this)}};window.AudioContext=W;if(window.webkitAudioContext)window.webkitAudioContext=W}
+const poll=()=>{let on=false;
+ for(const m of document.querySelectorAll('video,audio'))if(!m.paused&&!m.ended&&!m.muted&&m.volume>0&&m.readyState>2){on=true;break}
+ if(!on)for(const c of ctxs)if(c.state==='running'){on=true;break}
+ if(on!==last){last=on;console.debug('IMCAUDIO:'+(on?1:0))}};
+setInterval(poll,1000)})();"#;
+
+wrap_render_process_handler! {
+    struct Rph;
+    impl RenderProcessHandler {
+        fn on_context_created(&self, _b: Option<&mut Browser>, frame: Option<&mut Frame>, context: Option<&mut V8Context>) {
+            if let (Some(f), Some(c)) = (frame, context) {
+                if f.is_main() != 0 {
+                    let mut rv = None;
+                    let mut ex = None;
+                    c.eval(Some(&cs(AUDIO_PROBE)), Some(&cs("imc://probe")), 0, Some(&mut rv), Some(&mut ex));
+                    let cfg = command_line_get_global().map(|cl| CefString::from(&cl.switch_value(Some(&cs("imc-gestures")))).to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| "{}".into());
+                    let js = format!("{GESTURE_JS}\nwindow.__imcGset({cfg});");
+                    c.eval(Some(&cs(&js)), Some(&cs("imc://gesture")), 0, Some(&mut rv), Some(&mut ex));
+                }
+            }
+        }
+    }
+}
+
+wrap_app! {
+    struct ImcApp {
+        vpn: config::Vpn,
+        gestures: String,
+        hw: bool,
+    }
+    impl App {
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(Rph::new())
+        }
+        // Same privacy posture as the WebView2 build: no background phoning home.
+        fn on_before_command_line_processing(&self, process_type: Option<&CefString>, cmd: Option<&mut CommandLine>) {
+            let (Some(cmd), true) = (cmd, process_type.is_none_or(|p| p.to_string().is_empty())) else { return };
+            for s in ["disable-background-networking", "disable-sync", "disable-component-update", "disable-domain-reliability",
+                      "disable-client-side-phishing-detection", "disable-breakpad", "no-pings", "no-first-run"] {
+                cmd.append_switch(Some(&cs(s)));
+            }
+            cmd.append_switch_with_value(Some(&cs("disable-features")), Some(&cs("MediaRouter,Translate,OptimizationHints,AutofillServerCommunication")));
+            cmd.append_switch_with_value(Some(&cs("enable-features")), Some(&cs("StrictOriginIsolation")));
+            if !self.hw {
+                cmd.append_switch(Some(&cs("disable-gpu")));
+                cmd.append_switch(Some(&cs("disable-gpu-compositing")));
+            }
+            cmd.append_switch_with_value(Some(&cs("imc-gestures")), Some(&cs(&self.gestures)));
+            // Proxy, bypass list and WebRTC leak policy come from the same builder as the WebView2 build.
+            for tok in vpn::browser_args(&self.vpn).split_whitespace() {
+                let tok = tok.trim_start_matches("--").replace('"', "");
+                match tok.split_once('=') {
+                    Some((k, v)) => cmd.append_switch_with_value(Some(&cs(k)), Some(&cs(v))),
+                    None => cmd.append_switch(Some(&cs(&tok))),
+                }
+            }
+        }
+    }
+}
+
+// ---- Application state --------------------------------------------------------------------
+
+struct Tab {
+    id: usize,
+    url: String,
+    title: String,
+    loading: bool,
+    audible: bool,
+    muted: bool,
+    private: bool,
+    /// Hibernated: the page was discarded and is rebuilt from `url` when the tab is opened.
+    frozen: bool,
+    /// Current zoom factor (1.0 = 100%).
+    zoom: f64,
+    last_active: Instant,
+}
+
+struct Shell {
+    window: Window,
+    tx: EventLoopProxy<Ev>,
+    tabs: Vec<Tab>,
+    active: usize,
+    next: usize,
+    cfg: Config,
+    panel: bool,
+    bookmarks: Vec<bookmarks::Bookmark>,
+    ui_ready: bool,
+    shield: Arc<Shield>,
+    /// In-memory profile shared by all Ghost tabs; dropped (and the data with it) when the last one closes.
+    ghost_ctx: Option<RequestContext>,
+    /// URLs of recently closed tabs (not Ghost), newest last.
+    closed: Vec<String>,
+    upd: updater::Ctl,
+}
+
+fn host_hwnd(id: usize) -> Option<HWND> {
+    BROWSERS.with(|b| b.borrow().get(&id).and_then(|b| b.host()).map(|h| HWND(h.window_handle().0 as *mut _)))
+}
+
+fn place(id: usize, x: i32, y: i32, w: i32, h: i32, show: bool) {
+    if let Some(hwnd) = host_hwnd(id) {
+        let flag = if show { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
+        unsafe {
+            let _ = SetWindowPos(hwnd, if show && id != UI_ID { Some(HWND_TOP) } else { None }, x, y, w.max(0), h.max(0), SWP_NOACTIVATE | flag | if show && id != UI_ID { Default::default() } else { SWP_NOZORDER });
+        }
+    }
 }
 
 fn search_base(engine: &str) -> &'static str {
@@ -151,256 +457,161 @@ fn search_base(engine: &str) -> &'static str {
     }
 }
 
-/// Omnibox text -> (url, explicit_http)
-fn normalize(t: &str, engine: &str) -> (String, bool) {
+fn normalize(t: &str, engine: &str) -> String {
     let t = t.trim();
-    if let Some(u) = internal::from_typed(t) {
-        return (u, false);
-    }
     let lower = t.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("file://") {
-        return (t.into(), false);
-    }
-    if lower.starts_with("http://") {
-        return (t.into(), true);
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("file://") {
+        return t.into();
     }
     if !t.contains(' ') && !t.contains("://") && (t.contains('.') || lower.starts_with("localhost")) && !t.starts_with('.') {
-        return (format!("https://{t}"), false);
+        return format!("https://{t}");
     }
     let q: String = t
         .bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
         .collect();
-    (format!("{}{q}", search_base(engine)), false)
+    format!("{}{q}", search_base(engine))
 }
 
-fn load_engine() -> adblock::Engine {
-    let mut e = adblock::Engine::new();
-    e.load_list(include_str!("../data/builtin.txt"));
-    if let Ok(rd) = std::fs::read_dir(config::lists_dir()) {
-        for f in rd.flatten() {
-            if f.path().extension().is_some_and(|x| x == "txt") {
-                if let Ok(s) = std::fs::read_to_string(f.path()) {
-                    e.load_list(&s);
-                }
+impl Shell {
+    fn spawn(&mut self, id: usize, url: &str, private: bool) -> bool {
+        let r = self.content_rect();
+        let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(sys::HWND(self.window.hwnd() as *mut _), &r);
+        let mut client = Cl::new(id, self.tx.clone(), Some(self.shield.clone()));
+        let mut ctx = if private {
+            if self.ghost_ctx.is_none() {
+                // Empty cache_path = nothing touches the disk.
+                self.ghost_ctx = request_context_create_context(Some(&RequestContextSettings::default()), None);
             }
-        }
-    }
-    e
-}
-
-impl App {
-    fn private_dir() -> std::path::PathBuf {
-        config::private_root().join(std::process::id().to_string())
-    }
-
-    /// Deletes the Ghost profile once no Ghost tab is left (retries while Chromium releases its files).
-    fn end_private_if_unused(&mut self, wait: bool) {
-        if self.tabs.iter().any(|t| t.private) || self.private_ctx.is_none() {
-            return;
-        }
-        self.private_ctx = None;
-        let dir = Self::private_dir();
-        let wipe = move || {
-            for _ in 0..40 {
-                if std::fs::remove_dir_all(&dir).is_ok() || !dir.exists() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(150));
-            }
-        };
-        if wait {
-            wipe();
+            self.ghost_ctx.clone()
         } else {
-            std::thread::spawn(wipe);
+            None
+        };
+        let browser = browser_host_create_browser_sync(Some(&info), Some(&mut client), Some(&cs(url)), Some(&BrowserSettings::default()), None, ctx.as_mut());
+        match browser {
+            Some(b) => {
+                BROWSERS.with(|m| m.borrow_mut().insert(id, b));
+                true
+            }
+            None => {
+                eprintln!("tab creation failed");
+                false
+            }
         }
     }
 
     fn new_tab(&mut self, url: &str, private: bool) -> usize {
         let id = self.next;
         self.next += 1;
-        let (p_nav, p_title, p_load, p_win) = (self.proxy.clone(), self.proxy.clone(), self.proxy.clone(), self.proxy.clone());
-        let cur = Arc::new(Mutex::new(String::new()));
-        let (cur_nav, cur_perm) = (cur.clone(), cur.clone());
-        let https_first = self.cfg.https_first;
-        let insecure = self.insecure_ok.clone();
-        let allow = self.cfg.permission_allow.clone();
-        let css = self.shield.engine.read().unwrap().cosmetic_css();
-        let css_js = format!(
-            "(()=>{{const c={};if(!c)return;const a=()=>{{const s=document.createElement('style');s.textContent=c;(document.head||document.documentElement).appendChild(s)}};\
-             document.readyState==='loading'?document.addEventListener('DOMContentLoaded',a):a()}})();",
-            Value::String(css)
-        );
-        let bounds = content_bounds(&self.window, self.panel, self.cfg.vertical_tabs);
-        let p_audio = self.proxy.clone();
-        let p_gest = self.proxy.clone();
-        let p_sec = self.proxy.clone();
-        let p_zoom = self.proxy.clone();
-        let p_settings = self.proxy.clone();
-        let (internal_data, internal_shield) = (self.internal.clone(), self.shield.clone());
-        let init_js = format!("{css_js}\n{GESTURE_JS}\nwindow.__imcGset({});", self.cfg.gestures.page_config());
-
-        let ctx = if private {
-            self.private_ctx.get_or_insert_with(|| WebContext::new(Some(Self::private_dir())))
-        } else {
-            &mut self.ctx
-        };
-        let wv = WebViewBuilder::new_with_web_context(ctx)
-            .with_bounds(bounds)
-            .with_url(url)
-            .with_initialization_script(init_js)
-            // Pages can only ever send a clean gesture path through here; the host maps it to the user's action.
-            .with_ipc_handler(move |r| {
-                if let Some(path) = r.body().strip_prefix("IMCG:").and_then(config::Gestures::clean_path) {
-                    let _ = p_gest.send_event(Ev::Gesture(path));
-                } else if let Some(d) = r.body().strip_prefix("IMCZ:").filter(|d| ["in", "out", "reset"].contains(d)) {
-                    let _ = p_zoom.send_event(Ev::Zoom(d.to_string()));
-                }
-            })
-            .with_additional_browser_args(self.args.clone())
-            .with_browser_extensions_enabled(!private)
-            .with_extensions_path(config::extensions_dir())
-            .with_custom_protocol("imc".into(), move |_id, req| {
-                let name = req.uri().path().trim_matches('/').to_string();
-                let (status, html) = match internal::page(&name, &internal_data.read().unwrap(), &internal_shield) {
-                    Some(h) => (200, h),
-                    None => (404, internal::not_found(&name)),
-                };
-                wry::http::Response::builder()
-                    .status(status)
-                    .header("Content-Type", "text/html; charset=utf-8")
-                    .header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'")
-                    .header("X-Frame-Options", "DENY")
-                    .header("Cache-Control", "no-store")
-                    .body(std::borrow::Cow::Owned(html.into_bytes()))
-                    .unwrap()
-            })
-            .with_navigation_handler(move |u| {
-                // imc://settings opens the settings panel instead of loading a page
-                if let Some(section) = internal::settings_section(&u) {
-                    let _ = p_settings.send_event(Ev::Ipc(json!({"cmd": "open_settings", "section": section}).to_string()));
-                    return false;
-                }
-                if https_first && u.starts_with("http://") {
-                    let h = host_of(&u);
-                    if !is_local(h) && !insecure.lock().unwrap().contains(h) {
-                        let _ = p_nav.send_event(Ev::Go(id, u.replacen("http://", "https://", 1)));
-                        return false;
-                    }
-                }
-                *cur_nav.lock().unwrap() = u.clone();
-                let _ = p_nav.send_event(Ev::Url(id, u));
-                true
-            })
-            .with_document_title_changed_handler(move |t| {
-                let _ = p_title.send_event(Ev::Title(id, t));
-            })
-            .with_on_page_load_handler(move |e, _| {
-                let _ = p_load.send_event(Ev::Load(id, matches!(e, PageLoadEvent::Started)));
-            })
-            .with_new_window_req_handler(move |u, _| {
-                let _ = p_win.send_event(Ev::Open(u));
-                NewWindowResponse::Deny
-            })
-            // Zero ambient authority: deny unless this exact origin was whitelisted in config.json.
-            .with_permission_handler(move |kind: PermissionKind| {
-                let url = cur_perm.lock().unwrap().clone();
-                let origin = url.split('/').take(3).collect::<Vec<_>>().join("/");
-                match allow.get(&origin) {
-                    Some(list) if list.iter().any(|k| *k == kind.to_string()) => PermissionResponse::Allow,
-                    _ => PermissionResponse::Deny,
-                }
-            })
-            .build_as_child(&self.window);
-
-        let wv = match wv {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("tab creation failed: {e}");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = winhook::install_shield(&wv, self.shield.clone()) {
-            eprintln!("request shield failed to install: {e}");
-        }
-        if let Err(e) = winhook::watch_audio(&wv, move |on| {
-            let _ = p_audio.send_event(Ev::Audio(id, on));
-        }) {
-            eprintln!("audio events unavailable: {e}");
-        }
-        if let Err(e) = winhook::watch_security(&wv, move |j| {
-            let _ = p_sec.send_event(Ev::Security(id, j));
-        }) {
-            eprintln!("certificate info unavailable: {e}");
-        }
-        winhook::disable_native_zoom(&wv);
-        winhook::enable_status_bar(&wv);
-        {
-            let p = self.proxy.clone();
-            if let Err(e) = winhook::watch_downloads(&wv, self.dl_ids.clone(), downloads::dir(), private, move |ev| {
-                let _ = p.send_event(Ev::Download(ev));
-            }) {
-                eprintln!("download tracking unavailable: {e}");
-            }
-        }
-        winhook::background(&wv);
-        self.tabs.push(Tab {
-            id,
-            wv,
-            url: url.into(),
-            title: String::new(),
-            loading: true,
-            frozen: false,
-            audible: false,
-            muted: false,
-            private,
-            zoom: 1.0,
-            last_active: Instant::now(),
-        });
+        self.spawn(id, url, private);
+        self.tabs.push(Tab { id, url: url.into(), title: String::new(), loading: true, audible: false, muted: false, private, frozen: false, zoom: 1.0, last_active: Instant::now() });
         id
     }
 
-    fn activate(&mut self, id: usize) {
-        if !self.tabs.iter().any(|t| t.id == id) {
-            return;
-        }
-        let prev = self.active;
-        let hide_all = self.panel;
-        for t in &mut self.tabs {
-            if t.id == id {
-                if t.frozen {
-                    winhook::resume(&t.wv);
-                    t.frozen = false;
+    /// Blank the page so its renderer memory is released; the tab keeps its URL for waking.
+    fn discard(&mut self, id: usize) {
+        BROWSERS.with(|m| {
+            if let Some(b) = m.borrow().get(&id) {
+                if let Some(f) = b.main_frame() {
+                    f.load_url(Some(&cs("about:blank")));
                 }
-                t.last_active = Instant::now();
-                let _ = t.wv.set_bounds(content_bounds(&self.window, hide_all, self.cfg.vertical_tabs));
-                if !hide_all {
-                    let _ = t.wv.set_visible(true);
-                    let _ = t.wv.set_memory_usage_level(wry::MemoryUsageLevel::Normal);
-                    let _ = t.wv.focus();
+                if let Some(h) = b.host() {
+                    h.was_hidden(1);
                 }
-            } else if t.id == prev || !t.frozen {
-                if t.id == prev {
-                    t.last_active = Instant::now();
-                }
-                winhook::background(&t.wv);
+            }
+        });
+    }
+
+    /// Hibernate: tabs unused for `freeze_after_secs` (and not making sound) release their whole renderer.
+    fn tick(&mut self) {
+        let limit = Duration::from_secs(self.cfg.freeze_after_secs);
+        let stale: Vec<usize> = self.tabs.iter().filter(|t| t.id != self.active && !t.frozen && !t.audible && t.last_active.elapsed() >= limit).map(|t| t.id).collect();
+        for id in stale {
+            self.discard(id);
+            if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                t.frozen = true;
+                t.loading = false;
             }
         }
-        self.active = id;
+        if std::env::var_os("IMC_SELFTEST").is_some() {
+            let sum: Vec<String> = self.tabs.iter().map(|t| format!("{}{}{}{}", t.id, if t.private { "G" } else { "" }, if t.frozen { "Z" } else { "" }, if t.id == self.active { "*" } else { "" })).collect();
+            eprintln!("SELFTEST tabs [{}] ghost_ctx={}", sum.join(" "), self.ghost_ctx.is_some());
+        }
         self.push();
     }
 
+    fn save_session(&self) {
+        let urls: Vec<&str> = self.tabs.iter().filter(|t| !t.private).map(|t| t.url.as_str()).filter(|u| u.starts_with("http")).collect();
+        let _ = std::fs::write(config::root().join("session.json"), serde_json::to_string(&urls).unwrap());
+    }
+
+    fn relaunch(&self) {
+        self.save_session();
+        if let Ok(exe) = std::env::current_exe() {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("cmd")
+                .raw_arg(format!("/C timeout /t 3 /nobreak >nul & start \"\" \"{}\"", exe.display()))
+                .creation_flags(0x0800_0000)
+                .spawn();
+        }
+    }
+
+    fn content_rect(&self) -> Rect {
+        let s = self.window.inner_size();
+        let k = self.window.scale_factor();
+        let (left, top) = if self.cfg.vertical_tabs { (SIDEBAR_W, TITLEBAR_H + TOOLBAR_H) } else { (0.0, TOOLBAR_H + TABSTRIP_H) };
+        let (x, y) = ((left * k) as i32, (top * k) as i32);
+        Rect { x, y, width: (s.width as i32 - x).max(0), height: (s.height as i32 - y).max(0) }
+    }
+
     fn layout(&self) {
-        let s: LogicalSize<f64> = self.window.inner_size().to_logical(self.window.scale_factor());
-        let _ = self.chrome.set_bounds(Rect {
-            position: LogicalPosition::new(0.0, 0.0).into(),
-            size: LogicalSize::new(s.width, s.height).into(),
-        });
+        let s = self.window.inner_size();
+        place(UI_ID, 0, 0, s.width as i32, s.height as i32, true);
+        let r = self.content_rect();
         for t in &self.tabs {
-            let _ = t.wv.set_bounds(content_bounds(&self.window, self.panel, self.cfg.vertical_tabs));
-            if t.id == self.active && !t.frozen {
-                let _ = t.wv.set_visible(!self.panel);
+            let show = t.id == self.active && !self.panel;
+            place(t.id, r.x, r.y, r.width, r.height, show);
+        }
+    }
+
+    fn activate(&mut self, id: usize) {
+        if self.tabs.iter().any(|t| t.id == id) {
+            let prev = self.active;
+            if let Some(t) = self.tabs.iter_mut().find(|t| t.id == prev) {
+                t.last_active = Instant::now();
             }
+            let wake = self.tabs.iter().find(|t| t.id == id).filter(|t| t.frozen).map(|t| t.url.clone());
+            if let Some(url) = wake {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    t.frozen = false;
+                    t.loading = true;
+                }
+                BROWSERS.with(|m| {
+                    if let Some(f) = m.borrow().get(&id).and_then(|b| b.main_frame()) {
+                        f.load_url(Some(&cs(&url)));
+                    }
+                });
+            }
+            if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                t.last_active = Instant::now();
+            }
+            self.active = id;
+            BROWSERS.with(|m| {
+                for (bid, b) in m.borrow().iter() {
+                    if *bid != UI_ID {
+                        if let Some(h) = b.host() {
+                            h.was_hidden((*bid != id) as i32);
+                        }
+                    }
+                }
+            });
+            self.layout();
+            if let Some(b) = BROWSERS.with(|m| m.borrow().get(&id).cloned()) {
+                if let Some(h) = b.host() {
+                    h.set_focus(1);
+                }
+            }
+            self.push();
         }
     }
 
@@ -411,8 +622,12 @@ impl App {
                 self.closed.remove(0);
             }
         }
+        if let Some(b) = BROWSERS.with(|m| m.borrow_mut().remove(&id)) {
+            if let Some(h) = b.host() {
+                h.close_browser(1);
+            }
+        }
         self.tabs.retain(|t| t.id != id);
-        self.end_private_if_unused(false);
         if self.tabs.is_empty() {
             let home = self.cfg.home.clone();
             let n = self.new_tab(&home, false);
@@ -425,83 +640,29 @@ impl App {
         }
     }
 
-    fn navigate(&mut self, text: &str) {
-        let (url, explicit_http) = normalize(text, &self.cfg.search_engine);
-        if explicit_http {
-            self.insecure_ok.lock().unwrap().insert(host_of(&url).to_string());
-        }
-        self.go(self.active, &url);
+    fn with_active<R>(&self, f: impl FnOnce(&Browser) -> R) -> Option<R> {
+        BROWSERS.with(|m| m.borrow().get(&self.active).map(f))
     }
 
-    fn go(&mut self, id: usize, url: &str) {
-        if let Some(t) = self.tabs.iter().find(|t| t.id == id) {
-            let _ = t.wv.load_url(url);
-        }
-    }
-
-    fn push(&self) {
-        // Taskbar / Alt-Tab title follows the open tab (Ghost tabs stay generic so their pages are not shown there).
-        let title = match self.tabs.iter().find(|t| t.id == self.active) {
-            Some(t) if t.private => "Ghost tab - IMC Browse".to_string(),
-            Some(t) if !t.title.is_empty() => format!("{} - IMC Browse", t.title),
-            _ => "IMC Browse".to_string(),
-        };
-        if self.window.title() != title {
-            self.window.set_title(&title);
-        }
-        let down = self.cfg.vpn.enabled && vpn::TUNNEL_DOWN.load(Ordering::Relaxed);
-        let state = json!({
-            "tabs": self.tabs.iter().map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "frozen": t.frozen, "loading": t.loading, "audible": t.audible, "muted": t.muted, "private": t.private, "zoom": (t.zoom * 100.0).round()})).collect::<Vec<_>>(),
-            "active": self.active,
-            "bookmarks": self.bookmarks,
-            "blocked": self.shield.blocked.load(Ordering::Relaxed),
-            "adblock": self.shield.enabled.load(Ordering::Relaxed),
-            "vpn": {"enabled": self.cfg.vpn.enabled, "down": down},
-            "cfg": self.cfg,
-            "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some()})).collect::<Vec<_>>(),
-            "maximized": self.window.is_maximized(),
-            "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
+    fn set_browser_zoom(&self, id: usize, factor: f64) {
+        BROWSERS.with(|b| {
+            if let Some(h) = b.borrow().get(&id).and_then(|b| b.host()) {
+                // CEF zoom levels are logarithmic: factor = 1.2 ^ level
+                h.set_zoom_level(factor.ln() / 1.2f64.ln());
+            }
         });
-        let _ = self.chrome.evaluate_script(&format!("window.ui&&window.ui.set({state})"));
-    }
-
-    /// Runs the action bound to a drawn gesture by feeding the same command the toolbar would send.
-    fn gesture(&mut self, path: &str, flow: &mut ControlFlow) {
-        let Some(action) = self.cfg.gestures.action_for(path).map(String::from) else { return };
-        let cmd = match action.as_str() {
-            "back" => json!({"cmd": "back"}),
-            "forward" => json!({"cmd": "forward"}),
-            "reload" => json!({"cmd": "reload"}),
-            "stop" => json!({"cmd": "stop"}),
-            "new_tab" => json!({"cmd": "new"}),
-            "new_ghost" => json!({"cmd": "new", "private": true}),
-            "close_tab" => json!({"cmd": "close", "id": self.active}),
-            "reopen" => json!({"cmd": "reopen"}),
-            "next_tab" => json!({"cmd": "tab_next"}),
-            "prev_tab" => json!({"cmd": "tab_prev"}),
-            "home" => json!({"cmd": "go", "text": self.cfg.home}),
-            "bookmark" => json!({"cmd": "bookmark"}),
-            "mute_tab" => json!({"cmd": "mute", "id": self.active}),
-            "fullscreen" => json!({"cmd": "fullscreen"}),
-            "print" => json!({"cmd": "print"}),
-            "focus_url" => json!({"cmd": "focus_url"}),
-            "scroll_top" => json!({"cmd": "scroll_top"}),
-            "scroll_bottom" => json!({"cmd": "scroll_bottom"}),
-            _ => return,
-        };
-        self.ipc(&cmd.to_string(), flow);
     }
 
     /// Applies the remembered zoom for the tab's site (Ghost tabs keep their own session-only level).
     fn apply_zoom(&mut self, id: usize) {
         let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) else { return };
-        if t.private {
+        if t.private || t.frozen {
             return;
         }
         let want = self.cfg.zoom.get(host_of(&t.url)).copied().unwrap_or(1.0);
         if (t.zoom - want).abs() > 0.001 {
             t.zoom = want;
-            let _ = t.wv.zoom(want);
+            self.set_browser_zoom(id, want);
         }
     }
 
@@ -512,92 +673,21 @@ impl App {
             return;
         }
         t.zoom = next;
-        let _ = t.wv.zoom(next);
-        if !t.private && !t.url.starts_with("imc://") {
-            let host = host_of(&t.url).to_string();
-            if !host.is_empty() {
-                if (next - 1.0).abs() < 0.001 {
-                    self.cfg.zoom.remove(&host);
-                } else {
-                    self.cfg.zoom.insert(host, next);
-                }
-                self.cfg.save();
+        let (id, private, host) = (t.id, t.private, host_of(&t.url).to_string());
+        self.set_browser_zoom(id, next);
+        if !private && !host.is_empty() {
+            if (next - 1.0).abs() < 0.001 {
+                self.cfg.zoom.remove(&host);
+            } else {
+                self.cfg.zoom.insert(host, next);
             }
+            self.cfg.save();
         }
         self.push();
     }
 
-    /// Refreshes what the imc:// pages show about the running browser.
-    fn sync_internal(&self) {
-        let mut d = self.internal.write().unwrap();
-        d.webview = wry::webview_version().unwrap_or_else(|_| "unknown".into());
-        d.flags = self.args.replace("--", "\n--").trim().to_string();
-        d.hw = self.cfg.hardware_acceleration;
-        d.proxy = if self.cfg.vpn.enabled { format!("{} {}:{}{}", self.cfg.vpn.kind, self.cfg.vpn.host, self.cfg.vpn.port, if self.cfg.vpn.kill_switch { " (kill switch on)" } else { "" }) } else { "Direct connection (no proxy)".into() };
-        d.ext_ids = self.ext_ids.clone();
-        d.gestures = self.cfg.gestures.clone();
-        d.doh = self.cfg.doh.describe();
-    }
-
-    fn on_download(&mut self, e: DlEvent) {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let mut progress_only = false;
-        match e {
-            DlEvent::Started { id, name, path, url, total, private } => {
-                self.toast(&format!("Downloading {name}"));
-                self.downloads.push(downloads::Item { id, name, path, url, total, received: 0, state: "progress".into(), started: now, private });
-            }
-            DlEvent::Progress { id, received, total } => {
-                if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
-                    d.received = received;
-                    d.total = total;
-                }
-                progress_only = true;
-            }
-            DlEvent::State { id, state } => {
-                let mut msg = None;
-                if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
-                    d.state = state.into();
-                    if state == "done" {
-                        d.received = d.total.max(d.received);
-                        downloads::mark_of_the_web(std::path::Path::new(&d.path), &d.url);
-                        msg = Some(format!("Downloaded {}", d.name));
-                    } else if state == "failed" {
-                        msg = Some(format!("Download failed: {}", d.name));
-                    }
-                }
-                if let Some(m) = msg {
-                    self.toast(&m);
-                }
-                downloads::save(&self.downloads);
-            }
-        }
-        // progress ticks arrive many times a second; keep the UI to about five updates
-        if progress_only && self.last_dl_push.elapsed() < Duration::from_millis(200) {
-            return;
-        }
-        self.last_dl_push = Instant::now();
-        self.push_downloads(false);
-    }
-
-    /// Recent downloads for the UI (`open` also opens the popup).
-    fn push_downloads(&self, open: bool) {
-        let list: Vec<Value> = self
-            .downloads
-            .iter()
-            .rev()
-            .take(30)
-            .map(|d| {
-                let p = std::path::Path::new(&d.path);
-                json!({"id": d.id, "name": d.name, "state": d.state, "received": d.received, "total": d.total, "started": d.started,
-                       "exists": d.state != "done" || p.is_file(), "risky": downloads::is_risky(&d.name), "private": d.private})
-            })
-            .collect();
-        let _ = self.chrome.evaluate_script(&format!("window.ui.downloads({},{open})", Value::Array(list)));
-    }
-
     fn upd_send(&self) -> impl Fn(updater::UpdMsg) + Send + 'static {
-        let p = self.proxy.clone();
+        let p = self.tx.clone();
         move |m| {
             let _ = p.send_event(Ev::Update(m));
         }
@@ -605,11 +695,11 @@ impl App {
 
     fn push_update(&self) {
         let st = self.upd.state_json(self.cfg.update.auto, self.cfg.update.nightly);
-        let _ = self.chrome.evaluate_script(&format!("window.ui.updateState({st})"));
+        self.eval_ui(&format!("window.ui.updateState({st})"));
     }
 
     fn toast_act(&self, msg: &str, label: &str, cmd: &str) {
-        let _ = self.chrome.evaluate_script(&format!("window.ui.toast({},{{label:{},cmd:{}}})", Value::String(msg.into()), Value::String(label.into()), Value::String(cmd.into())));
+        self.eval_ui(&format!("window.ui.toast({},{{label:{},cmd:{}}})", Value::String(msg.into()), Value::String(label.into()), Value::String(cmd.into())));
     }
 
     fn check_updates(&mut self, manual: bool) {
@@ -638,38 +728,94 @@ impl App {
         self.push_update();
     }
 
-    fn save_session(&self) {
-        let urls: Vec<&str> = self.tabs.iter().filter(|t| !t.private).map(|t| t.url.as_str()).filter(|u| u.starts_with("http")).collect();
-        let _ = std::fs::write(config::root().join("session.json"), serde_json::to_string(&urls).unwrap());
+    fn eval_page(&self, js: &str) {
+        self.with_active(|b| {
+            if let Some(f) = b.main_frame() {
+                f.execute_java_script(Some(&cs(js)), Some(&cs("imc://page")), 0);
+            }
+        });
     }
 
-    fn relaunch(&self) {
-        self.save_session();
-        if let Ok(exe) = std::env::current_exe() {
-            // Wait for this process (and the WebView2 browser it owns) to release the profile, then start fresh.
-            use std::os::windows::process::CommandExt;
-            let _ = Command::new("cmd")
-                .raw_arg(format!("/C timeout /t 2 /nobreak >nul & start \"\" \"{}\"", exe.display()))
-                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                .spawn();
+    /// Runs the action bound to a drawn gesture by feeding the same command the toolbar would send.
+    fn gesture(&mut self, path: &str) -> bool {
+        let Some(action) = self.cfg.gestures.action_for(path).map(String::from) else { return false };
+        let cmd = match action.as_str() {
+            "back" => json!({"cmd": "back"}),
+            "forward" => json!({"cmd": "forward"}),
+            "reload" => json!({"cmd": "reload"}),
+            "stop" => json!({"cmd": "stop"}),
+            "new_tab" => json!({"cmd": "new"}),
+            "new_ghost" => json!({"cmd": "new", "private": true}),
+            "close_tab" => json!({"cmd": "close", "id": self.active}),
+            "reopen" => json!({"cmd": "reopen"}),
+            "next_tab" => json!({"cmd": "tab_next"}),
+            "prev_tab" => json!({"cmd": "tab_prev"}),
+            "home" => json!({"cmd": "go", "text": self.cfg.home}),
+            "bookmark" => json!({"cmd": "bookmark"}),
+            "mute_tab" => json!({"cmd": "mute", "id": self.active}),
+            "fullscreen" => json!({"cmd": "fullscreen"}),
+            "print" => json!({"cmd": "print"}),
+            "focus_url" => json!({"cmd": "focus_url"}),
+            "scroll_top" => json!({"cmd": "scroll_top"}),
+            "scroll_bottom" => json!({"cmd": "scroll_bottom"}),
+            _ => return false,
+        };
+        self.ipc(&cmd.to_string())
+    }
+
+    fn eval_ui(&self, js: &str) {
+        BROWSERS.with(|m| {
+            if let Some(f) = m.borrow().get(&UI_ID).and_then(|b| b.main_frame()) {
+                f.execute_java_script(Some(&cs(js)), Some(&cs("imc://ui")), 0);
+            }
+        });
+    }
+
+    fn push(&self) {
+        // Taskbar / Alt-Tab title follows the open tab (Ghost tabs stay generic so their pages are not shown there).
+        let title = match self.tabs.iter().find(|t| t.id == self.active) {
+            Some(t) if t.private => "Ghost tab - IMC Browse".to_string(),
+            Some(t) if !t.title.is_empty() => format!("{} - IMC Browse", t.title),
+            _ => "IMC Browse".to_string(),
+        };
+        if self.window.title() != title {
+            self.window.set_title(&title);
         }
+        if !self.ui_ready {
+            return;
+        }
+        let state = json!({
+            "tabs": self.tabs.iter().map(|t| json!({"id": t.id, "title": t.title, "url": t.url, "frozen": t.frozen, "loading": t.loading, "audible": t.audible, "muted": t.muted, "private": t.private, "zoom": (t.zoom * 100.0).round()})).collect::<Vec<_>>(),
+            "active": self.active,
+            "bookmarks": self.bookmarks,
+            "blocked": self.shield.blocked.load(Ordering::Relaxed),
+            "adblock": self.shield.enabled.load(Ordering::Relaxed),
+            "vpn": {"enabled": self.cfg.vpn.enabled, "down": self.cfg.vpn.enabled && vpn::TUNNEL_DOWN.load(Ordering::Relaxed)},
+            "cfg": self.cfg,
+            "extensions": [],
+            "maximized": self.window.is_maximized(),
+            "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
+        });
+        self.eval_ui(&format!("window.ui&&window.ui.set({state})"));
     }
 
-    fn ipc(&mut self, body: &str, flow: &mut ControlFlow) {
-        let Ok(m) = serde_json::from_str::<Value>(body) else { return };
-        match m["cmd"].as_str().unwrap_or("") {
-            "ready" => self.push(),
+    fn toast(&self, msg: &str) {
+        self.eval_ui(&format!("window.ui.toast({})", Value::String(msg.into())));
+    }
+
+    /// Returns true when the app should restart/quit.
+    fn ipc(&mut self, body: &str) -> bool {
+        let Ok(m) = serde_json::from_str::<Value>(body) else { return false };
+        let cmd = m["cmd"].as_str().unwrap_or("");
+        match cmd {
+            "ready" => {
+                self.ui_ready = true;
+                self.push();
+            }
             "new" => {
                 let home = self.cfg.home.clone();
                 let n = self.new_tab(&home, m["private"].as_bool().unwrap_or(false));
                 self.activate(n);
-            }
-            "engine" => {
-                if let Some(e) = m["id"].as_str().filter(|e| ["google", "bing", "duckduckgo", "brave", "yahoo"].contains(e)) {
-                    self.cfg.search_engine = e.into();
-                    self.cfg.save();
-                    self.push();
-                }
             }
             "close" => {
                 if let Some(id) = m["id"].as_u64() {
@@ -681,12 +827,54 @@ impl App {
                     self.activate(id as usize);
                 }
             }
-            "go" => self.navigate(m["text"].as_str().unwrap_or("")),
-            "back" => self.eval_active("history.back()"),
-            "forward" => self.eval_active("history.forward()"),
+            "go" => {
+                let url = normalize(m["text"].as_str().unwrap_or(""), &self.cfg.search_engine);
+                self.with_active(|b| {
+                    if let Some(f) = b.main_frame() {
+                        f.load_url(Some(&cs(&url)));
+                    }
+                });
+            }
+            "back" => {
+                self.with_active(|b| b.go_back());
+            }
+            "forward" => {
+                self.with_active(|b| b.go_forward());
+            }
             "reload" => {
-                if let Some(t) = self.tabs.iter().find(|t| t.id == self.active) {
-                    let _ = t.wv.reload();
+                self.with_active(|b| b.reload());
+            }
+            "panel" => {
+                self.panel = m["open"].as_bool().unwrap_or(false);
+                self.layout();
+            }
+            "engine" => {
+                if let Some(e) = m["id"].as_str().filter(|e| ["google", "bing", "duckduckgo", "brave", "yahoo"].contains(e)) {
+                    self.cfg.search_engine = e.into();
+                    self.cfg.save();
+                    self.push();
+                }
+            }
+            "prefs" => {
+                if let Ok(t) = serde_json::from_value::<config::Theme>(m["theme"].clone()) {
+                    self.cfg.theme = t;
+                }
+                self.cfg.vertical_tabs = m["vertical_tabs"].as_bool().unwrap_or(self.cfg.vertical_tabs);
+                self.cfg.freeze_after_secs = m["freeze_after_secs"].as_u64().unwrap_or(self.cfg.freeze_after_secs).max(10);
+                self.cfg.save();
+                self.layout();
+                self.push();
+            }
+            "bookmark" => {
+                if let Some(t) = self.tabs.iter().find(|t| t.id == self.active && !t.private) {
+                    if let Some(i) = self.bookmarks.iter().position(|b| b.url == t.url) {
+                        self.bookmarks.remove(i);
+                    } else if t.url.starts_with("http") {
+                        let title = if t.title.is_empty() { t.url.clone() } else { t.title.clone() };
+                        self.bookmarks.push(bookmarks::Bookmark { title, url: t.url.clone(), folder: String::new() });
+                    }
+                    bookmarks::save(&self.bookmarks);
+                    self.push();
                 }
             }
             "toolbar" => {
@@ -695,8 +883,16 @@ impl App {
                 self.cfg.save();
                 self.push();
             }
-            "stop" => self.eval_active("window.stop()"),
-            "print" => self.eval_active("window.print()"),
+            "stop" => {
+                self.with_active(|b| b.stop_load());
+            }
+            "print" => {
+                self.with_active(|b| {
+                    if let Some(f) = b.main_frame() {
+                        f.execute_java_script(Some(&cs("window.print()")), Some(&cs("imc://print")), 0);
+                    }
+                });
+            }
             "fullscreen" => {
                 let on = self.window.fullscreen().is_none();
                 self.window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
@@ -707,63 +903,28 @@ impl App {
                     self.activate(n);
                 }
             }
-            "ext_open" => {
-                let dir = m["dir"].as_str().unwrap_or("");
-                let Some(it) = self.ext_items.iter().find(|e| e.dir == dir).cloned() else { return };
-                let id = self
-                    .ext_ids
-                    .iter()
-                    .find(|(_, n)| *n == it.name)
-                    .or_else(|| if self.ext_items.len() == 1 { self.ext_ids.first() } else { None })
-                    .map(|(i, _)| i.clone());
-                match (id, it.popup.or(it.options)) {
-                    (Some(id), Some(page)) => {
-                        let n = self.new_tab(&format!("chrome-extension://{id}/{page}"), false);
-                        self.activate(n);
-                    }
-                    (None, _) => self.toast("Extension ids are not available yet. Try again in a few seconds."),
-                    (_, None) => self.toast("This extension has no popup or options page to open."),
-                }
-            }
-            "cards" => self.push_cards(),
-            "card_add" => {
-                let mut list = cards::load();
-                let (month, year) = (m["month"].as_u64().unwrap_or(0) as u8, m["year"].as_u64().unwrap_or(0) as u16);
-                match cards::add(&mut list, m["label"].as_str().unwrap_or(""), m["name"].as_str().unwrap_or(""), m["number"].as_str().unwrap_or(""), month, year) {
-                    Ok(what) => {
-                        cards::save(&list);
-                        self.toast(&format!("Saved {what}. The number is encrypted; the security code is never stored."));
-                    }
-                    Err(e) => self.toast(&e),
-                }
-                self.push_cards();
-            }
-            "card_delete" => {
-                let mut list = cards::load();
-                if let Some(i) = m["i"].as_u64().map(|i| i as usize).filter(|&i| i < list.len()) {
-                    list.remove(i);
-                    cards::save(&list);
-                }
-                self.push_cards();
-            }
-            "card_fill" => self.fill_card(m["i"].as_u64().unwrap_or(u64::MAX) as usize),
             "gestures" => {
                 if let Ok(mut g) = serde_json::from_value::<config::Gestures>(m["gestures"].clone()) {
-                    let mut seen = HashSet::new();
+                    let mut seen = std::collections::HashSet::new();
                     g.binds.retain(|b| config::Gestures::clean_path(&b.path).is_some() && config::GESTURE_ACTIONS.iter().any(|(id, _)| *id == b.action) && seen.insert(b.path.clone()));
                     g.min_distance = g.min_distance.clamp(10, 120);
                     self.cfg.gestures = g;
                     self.cfg.save();
-                    self.sync_internal();
-                    let js = format!("window.__imcGset&&window.__imcGset({})", self.cfg.gestures.page_config());
-                    for t in &self.tabs {
-                        let _ = t.wv.evaluate_script(&js);
-                    }
+                    let page = self.cfg.gestures.page_config();
+                    *self.shield.gest.write().unwrap() = page.clone();
+                    let js = format!("window.__imcGset&&window.__imcGset({page})");
+                    BROWSERS.with(|b| {
+                        for (id, br) in b.borrow().iter() {
+                            if *id != UI_ID {
+                                if let Some(f) = br.main_frame() {
+                                    f.execute_java_script(Some(&cs(&js)), Some(&cs("imc://gestures")), 0);
+                                }
+                            }
+                        }
+                    });
                     self.push();
                 }
             }
-            // Dev hook (only with IMC_SELFTEST): run script in the active page so gestures can be exercised unattended.
-            "selftest_eval" if std::env::var_os("IMC_SELFTEST").is_some() => self.eval_active(m["js"].as_str().unwrap_or("")),
             "tab_next" | "tab_prev" => {
                 if let Some(i) = self.tabs.iter().position(|t| t.id == self.active) {
                     let n = self.tabs.len();
@@ -773,118 +934,30 @@ impl App {
                 }
             }
             "focus_url" => {
-                let _ = self.chrome.focus();
-                let _ = self.chrome.evaluate_script("document.getElementById('url').focus()");
+                BROWSERS.with(|b| {
+                    if let Some(h) = b.borrow().get(&UI_ID).and_then(|b| b.host()) {
+                        h.set_focus(1);
+                    }
+                });
+                self.eval_ui("document.getElementById('url').focus()");
             }
-            "scroll_top" => self.eval_active("window.scrollTo({top:0,behavior:'smooth'})"),
-            "scroll_bottom" => self.eval_active("window.scrollTo({top:document.documentElement.scrollHeight,behavior:'smooth'})"),
+            "scroll_top" => self.eval_page("window.scrollTo({top:0,behavior:'smooth'})"),
+            "scroll_bottom" => self.eval_page("window.scrollTo({top:document.documentElement.scrollHeight,behavior:'smooth'})"),
             "site_info" => {
-                let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return };
-                let url = t.url.clone();
-                let st: Value = self.sec.get(&t.id).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-                let c = &st["visibleSecurityState"]["certificateSecurityState"];
-                let cert = if c.is_object() {
-                    json!({"subject": c["subjectName"], "issuer": c["issuer"], "from": c["validFrom"], "to": c["validTo"], "protocol": c["protocol"], "cipher": c["cipher"], "keyExchange": c["keyExchange"], "error": c["certificateNetworkError"]})
-                } else {
-                    Value::Null
-                };
-                let web = url.starts_with("http://") || url.starts_with("https://");
-                let info = json!({"url": url, "host": host_of(&url), "secure": url.starts_with("https://"), "local": !web, "cert": cert, "clearable": web});
-                if std::env::var_os("IMC_SELFTEST").is_some() {
-                    eprintln!("SELFTEST siteinfo {info}");
-                }
-                let _ = self.chrome.evaluate_script(&format!("window.ui.siteInfo({info})"));
+                let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return false };
+                let web = t.url.starts_with("http://") || t.url.starts_with("https://");
+                let info = json!({"url": t.url, "host": host_of(&t.url), "secure": t.url.starts_with("https://"), "local": !web, "cert": Value::Null, "clearable": false,
+                    "note": "Certificate details and clearing site data are available in the WebView2 build for now."});
+                self.eval_ui(&format!("window.ui.siteInfo({info})"));
             }
-            "site_clear" => {
-                let Some(t) = self.tabs.iter().find(|t| t.id == self.active) else { return };
-                let (url, kind) = (t.url.clone(), m["kind"].as_str().unwrap_or("").to_string());
-                let host = host_of(&url).to_string();
-                let site = adblock::registrable(&host).to_string();
-                let origin = url.split('/').take(3).collect::<Vec<_>>().join("/");
-                let p = self.proxy.clone();
-                let sent = |msg: String| {
-                    let _ = p.send_event(Ev::Toast(msg));
-                };
-                let ok = match kind.as_str() {
-                    "cookies" => {
-                        let label = site.clone();
-                        let p2 = self.proxy.clone();
-                        winhook::clear_cookies(&t.wv, site, move |n| {
-                            let _ = p2.send_event(Ev::Toast(format!("Cleared {n} cookies for {label}.")));
-                        })
-                        .is_ok()
-                    }
-                    "data" => {
-                        let (p2, id) = (self.proxy.clone(), t.id);
-                        let _ = id;
-                        winhook::cdp(&t.wv, "Storage.clearDataForOrigin", &json!({"origin": origin, "storageTypes": "all"}).to_string(), move |_| {
-                            let _ = p2.send_event(Ev::Toast(format!("Cleared site data for {host}. Reloading.")));
-                        })
-                        .is_ok()
-                    }
-                    "cache" => {
-                        let p2 = self.proxy.clone();
-                        winhook::cdp(&t.wv, "Network.clearBrowserCache", "{}", move |_| {
-                            let _ = p2.send_event(Ev::Toast("Cleared the browser cache.".into()));
-                        })
-                        .is_ok()
-                    }
-                    _ => false,
-                };
-                if !ok {
-                    sent("Could not clear that data.".into());
-                } else if kind == "data" {
-                    let _ = t.wv.reload();
-                }
-            }
-            "dl_list" => self.push_downloads(true),
-            "dl_open" | "dl_show" | "dl_cancel" | "dl_remove" => {
-                let id = m["id"].as_u64().unwrap_or(0);
-                let Some(i) = self.downloads.iter().position(|d| d.id == id) else { return };
-                let path = std::path::PathBuf::from(&self.downloads[i].path);
-                match m["cmd"].as_str().unwrap_or("") {
-                    "dl_open" => {
-                        if self.downloads[i].state == "done" && downloads::inside_downloads(&path) {
-                            if !downloads::open_file(&path) {
-                                self.toast("Windows could not open that file.");
-                            }
-                        } else {
-                            self.toast("That file is no longer in your Downloads folder.");
-                        }
-                    }
-                    "dl_show" => {
-                        if path.is_file() {
-                            downloads::reveal(&path);
-                        } else {
-                            downloads::open_folder(&downloads::dir());
-                        }
-                    }
-                    "dl_cancel" => winhook::cancel_download(id),
-                    _ => {
-                        self.downloads.remove(i);
-                        downloads::save(&self.downloads);
-                        self.push_downloads(false);
-                    }
-                }
-            }
-            "dl_clear" => {
-                self.downloads.retain(|d| d.state == "progress");
-                downloads::save(&self.downloads);
-                self.push_downloads(false);
-            }
-            "dl_folder" => downloads::open_folder(&downloads::dir()),
-            "open_settings" => {
-                let sec = m["section"].as_str().unwrap_or("general").to_string();
-                let _ = self.chrome.evaluate_script(&format!("panel(true);section({})", Value::String(sec)));
-            }
+            "site_clear" => self.toast("Clearing site data is not in the CEF build yet."),
             "hwaccel" => {
                 self.cfg.hardware_acceleration = m["enabled"].as_bool().unwrap_or(true);
                 self.cfg.save();
-                self.sync_internal();
             }
             "restart" => {
                 self.relaunch();
-                *flow = ControlFlow::Exit;
+                return true;
             }
             "doh" => {
                 let provider = m["provider"].as_str().unwrap_or("cloudflare");
@@ -896,7 +969,6 @@ impl App {
                     strict: m["strict"].as_bool().unwrap_or(false),
                 };
                 self.cfg.save();
-                self.sync_internal();
                 if self.cfg.doh.enabled && self.cfg.doh.template().is_none() {
                     self.toast("That server address is not valid. It must start with https://");
                 } else {
@@ -939,7 +1011,7 @@ impl App {
             "win_max" => self.window.set_maximized(!self.window.is_maximized()),
             "win_close" => {
                 self.save_session();
-                *flow = ControlFlow::Exit;
+                return true;
             }
             "adblock" => {
                 let on = !self.shield.enabled.load(Ordering::Relaxed);
@@ -948,10 +1020,27 @@ impl App {
                 self.cfg.save();
                 self.push();
             }
-            "panel" => {
-                self.panel = m["open"].as_bool().unwrap_or(false);
-                self.layout();
+            "mute" => {
+                if let Some(t) = m["id"].as_u64().and_then(|id| self.tabs.iter_mut().find(|t| t.id == id as usize)) {
+                    t.muted = !t.muted;
+                    let (id, muted) = (t.id, t.muted);
+                    BROWSERS.with(|b| {
+                        if let Some(h) = b.borrow().get(&id).and_then(|b| b.host()) {
+                            h.set_audio_muted(muted as i32);
+                        }
+                    });
+                }
+                self.push();
             }
+            "bm_delete" => {
+                if let Some(i) = m["i"].as_u64().map(|i| i as usize).filter(|&i| i < self.bookmarks.len()) {
+                    self.bookmarks.remove(i);
+                    bookmarks::save(&self.bookmarks);
+                    self.push();
+                }
+            }
+            // Still on the WebView2 build: blocker, mute, proxy settings, imports, passwords.
+            // Privacy and proxy settings need a restart (they are browser-wide switches).
             "settings" => {
                 if let Ok(mut c) = serde_json::from_value::<Config>(m["cfg"].clone()) {
                     c.permission_allow = self.cfg.permission_allow.clone();
@@ -967,501 +1056,222 @@ impl App {
                     c.vertical_tabs = self.cfg.vertical_tabs;
                     c.save();
                     self.relaunch();
-                    *flow = ControlFlow::Exit;
+                    return true;
                 }
             }
-            // Live preferences (no restart): theme, tab layout, sleep delay.
-            "prefs" => {
-                if let Ok(t) = serde_json::from_value::<config::Theme>(m["theme"].clone()) {
-                    self.cfg.theme = t;
-                }
-                self.cfg.vertical_tabs = m["vertical_tabs"].as_bool().unwrap_or(self.cfg.vertical_tabs);
-                self.cfg.freeze_after_secs = m["freeze_after_secs"].as_u64().unwrap_or(self.cfg.freeze_after_secs).max(10);
-                self.cfg.save();
-                self.layout();
-                self.push();
-            }
-            "mute" => {
-                if let Some(t) = m["id"].as_u64().and_then(|id| self.tabs.iter_mut().find(|t| t.id == id as usize)) {
-                    t.muted = !t.muted;
-                    winhook::set_muted(&t.wv, t.muted);
-                }
-                self.push();
-            }
-            "bookmark" => {
-                let Some(t) = self.tabs.iter().find(|t| t.id == self.active && !t.private) else { return };
-                if let Some(i) = self.bookmarks.iter().position(|b| b.url == t.url) {
-                    self.bookmarks.remove(i);
-                } else if t.url.starts_with("http") {
-                    let title = if t.title.is_empty() { t.url.clone() } else { t.title.clone() };
-                    self.bookmarks.push(bookmarks::Bookmark { title, url: t.url.clone(), folder: String::new() });
-                }
-                bookmarks::save(&self.bookmarks);
-                self.push();
-            }
-            "bm_delete" => {
-                if let Some(i) = m["i"].as_u64().map(|i| i as usize).filter(|&i| i < self.bookmarks.len()) {
-                    self.bookmarks.remove(i);
-                    bookmarks::save(&self.bookmarks);
-                    self.push();
-                }
-            }
-            "import_bookmarks" => {
-                let found = bookmarks::parse_auto(m["text"].as_str().unwrap_or(""));
-                let (total, added) = (found.len(), bookmarks::merge(&mut self.bookmarks, found));
-                bookmarks::save(&self.bookmarks);
-                self.toast(&format!("Bookmarks: {added} imported, {} duplicates/invalid skipped", total - added));
-                self.push();
-            }
-            "import_browsers" => {
-                let mut report = vec![];
-                for (name, path) in bookmarks::browser_files() {
-                    let text = std::fs::read_to_string(&path).unwrap_or_default();
-                    let found = bookmarks::parse_auto(&text);
-                    report.push(format!("{name}: {}", bookmarks::merge(&mut self.bookmarks, found)));
-                }
-                bookmarks::save(&self.bookmarks);
-                self.toast(&if report.is_empty() {
-                    "No Chrome/Edge/Brave/Vivaldi profile found. Export bookmarks as HTML and import the file.".to_string()
-                } else {
-                    format!("Imported bookmarks - {}", report.join(", "))
-                });
-                self.push();
-            }
-            "creds" => self.push_creds(),
-            "import_passwords" => {
-                let mut c = passwords::load();
-                match passwords::import_csv(&mut c, m["text"].as_str().unwrap_or("")) {
-                    Ok((ok, skip)) => {
-                        passwords::save(&c);
-                        self.toast(&format!("Passwords: {ok} imported and encrypted, {skip} skipped. Delete the CSV file now: it is plaintext."));
-                    }
-                    Err(e) => self.toast(&format!("Password import failed: {e}")),
-                }
-                self.push_creds();
-            }
-            "pw_delete" => {
-                let mut c = passwords::load();
-                if let Some(i) = m["i"].as_u64().map(|i| i as usize).filter(|&i| i < c.len()) {
-                    c.remove(i);
-                    passwords::save(&c);
-                }
-                self.push_creds();
-            }
-            "pw_reveal" => {
-                let c = passwords::load();
-                if let Some(pw) = m["i"].as_u64().and_then(|i| c.get(i as usize)).and_then(|c| passwords::decrypt(&c.enc)) {
-                    let _ = self.chrome.evaluate_script(&format!("window.ui.revealed({},{})", m["i"], Value::String(pw)));
-                }
-            }
-            "pw_fill" => self.fill_password(m["i"].as_u64().unwrap_or(u64::MAX) as usize),
-            _ => {}
+            other => self.toast(&format!("'{other}' is not in the CEF build yet.")),
         }
-    }
-
-    /// List without numbers: brand, last four and expiry only.
-    fn push_cards(&self) {
-        let list: Vec<Value> = cards::load()
-            .iter()
-            .enumerate()
-            .map(|(i, c)| json!({"i": i, "label": c.label, "name": c.name, "brand": c.brand, "last4": c.last4, "month": c.exp_month, "year": c.exp_year}))
-            .collect();
-        let _ = self.chrome.evaluate_script(&format!("window.ui.cardsList({})", Value::Array(list)));
-    }
-
-    /// Fill only on an explicit click, only on an HTTPS page, only the main frame's matching fields.
-    fn fill_card(&self, i: usize) {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == self.active) else { return };
-        if !tab.url.starts_with("https://") {
-            self.toast("Not filled: card details are only filled on HTTPS pages.");
-            return;
-        }
-        let list = cards::load();
-        let Some(card) = list.get(i) else { return };
-        let Some(num) = cards::number(card) else {
-            self.toast("This card could not be decrypted (it was saved under another Windows account).");
-            return;
-        };
-        let js = format!(
-            "(function(num,name,mm,yyyy){{const set=(e,v)=>{{const P=e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;\
-             Object.getOwnPropertyDescriptor(P,'value').set.call(e,v);e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}))}};\
-             const find=(ac,rx)=>document.querySelector('[autocomplete~=\"'+ac+'\"]')||[...document.querySelectorAll('input,select')].find(e=>e.type!=='hidden'&&rx.test([e.name,e.id,e.getAttribute('aria-label'),e.placeholder].join(' ')));\
-             const pick=(e,vals)=>{{if(!e)return;if(e.tagName==='SELECT'){{const o=[...e.options].find(o=>vals.includes(o.value)||vals.includes(o.text.trim()));if(o)set(e,o.value)}}else set(e,vals[0])}};\
-             pick(find('cc-number',/card.?n|cc.?num|number/i),[num]);pick(find('cc-name',/card.?holder|name.?on|cc.?name/i),[name]);\
-             const m=find('cc-exp-month',/exp.*month|month/i),y=find('cc-exp-year',/exp.*year|year/i),exp=find('cc-exp',/exp|mm.?.?yy/i);\
-             pick(m,[mm,String(+mm)]);pick(y,[yyyy,yyyy.slice(2)]);\
-             if(exp&&exp!==m&&exp!==y)pick(exp,[mm+'/'+yyyy.slice(2),mm+' / '+yyyy.slice(2),mm+yyyy.slice(2)])}})({},{},{},{})",
-            Value::String(num),
-            Value::String(card.name.clone()),
-            Value::String(format!("{:02}", card.exp_month)),
-            Value::String(card.exp_year.to_string())
-        );
-        let _ = tab.wv.evaluate_script(&js);
-        self.toast(&format!("Filled {} ending {}. Enter the security code yourself.", card.brand, card.last4));
-    }
-
-    fn toast(&self, msg: &str) {
-        let _ = self.chrome.evaluate_script(&format!("window.ui.toast({})", Value::String(msg.into())));
-    }
-
-    /// Credential list without secrets; `match` flags entries for the active site.
-    fn push_creds(&self) {
-        let active_host = self.tabs.iter().find(|t| t.id == self.active).map(|t| passwords::host(&t.url)).unwrap_or_default();
-        let list: Vec<Value> = passwords::load()
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let h = passwords::host(&c.url);
-                let hit = !active_host.is_empty() && adblock::registrable(&h) == adblock::registrable(&active_host);
-                json!({"i": i, "url": c.url, "host": h, "username": c.username, "match": hit})
-            })
-            .collect();
-        let _ = self.chrome.evaluate_script(&format!("window.ui.creds({})", Value::Array(list)));
-    }
-
-    /// Fill only on explicit click, only over HTTPS, only on the saved site's own domain.
-    fn fill_password(&self, i: usize) {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == self.active) else { return };
-        let c = passwords::load();
-        let Some(cred) = c.get(i) else { return };
-        let same = adblock::registrable(&passwords::host(&cred.url)) == adblock::registrable(&passwords::host(&tab.url));
-        if !tab.url.starts_with("https://") || !same {
-            self.toast("Not filled: the open page is not an HTTPS page on this login's site.");
-            return;
-        }
-        let Some(pw) = passwords::decrypt(&cred.enc) else { return };
-        let js = format!(
-            "(function(u,p){{const ins=[...document.querySelectorAll('input')],pw=ins.find(e=>e.type==='password');if(!pw)return;\
-             const us=ins.slice(0,ins.indexOf(pw)).reverse().find(e=>['text','email','tel'].includes(e.type||'text'));\
-             const set=(e,v)=>{{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);\
-             e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}))}};\
-             if(us)set(us,u);set(pw,p)}})({},{})",
-            Value::String(cred.username.clone()),
-            Value::String(pw)
-        );
-        let _ = tab.wv.evaluate_script(&js);
-        self.toast("Filled.");
-    }
-
-    fn eval_active(&self, js: &str) {
-        if let Some(t) = self.tabs.iter().find(|t| t.id == self.active) {
-            let _ = t.wv.evaluate_script(js);
-        }
-    }
-
-    /// Hibernate idle background tabs.
-    fn tick(&mut self) {
-        let limit = Duration::from_secs(self.cfg.freeze_after_secs);
-        let mut changed = false;
-        for t in &mut self.tabs {
-            if t.id != self.active && !t.frozen && !t.audible && t.last_active.elapsed() >= limit {
-                winhook::suspend(&t.wv);
-                t.frozen = true;
-                changed = true;
-            }
-        }
-        if changed || self.shield.blocked.load(Ordering::Relaxed) > 0 {
-            self.push();
-        }
+        false
     }
 }
 
-fn cli(args: &[String]) -> bool {
-    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-    let Some(first) = args.first() else { return false };
-    if !first.starts_with("--") {
-        return false;
-    }
-    unsafe {
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-    }
-    match first.as_str() {
-        "--install-extension" => match args.get(1).map(|s| ext::install(s)) {
-            Some(Ok(m)) => println!("{m}"),
-            Some(Err(e)) => eprintln!("error: {e}"),
-            None => eprintln!("usage: imc-browse --install-extension <web-store-id | .crx/.xpi/.zip | https-url | folder>"),
-        },
-        "--list-extensions" => {
-            for (dir, name, ver) in ext::list() {
-                println!("{dir}\t{name}\t{ver}");
+/// Close every page, give CEF a moment to finish, then shut it down.
+fn finish() {
+    BROWSERS.with(|m| {
+        for b in m.borrow().values() {
+            if let Some(h) = b.host() {
+                h.close_browser(1);
             }
         }
-        "--remove-extension" => match args.get(1).map(|s| ext::remove(s)) {
-            Some(Ok(())) => println!("removed"),
-            Some(Err(e)) => eprintln!("error: {e}"),
-            None => eprintln!("usage: imc-browse --remove-extension <folder-name>"),
-        },
-        "--update-lists" => {
-            const LISTS: &[(&str, &str)] = &[
-                ("easylist", "https://easylist.to/easylist/easylist.txt"),
-                ("easyprivacy", "https://easylist.to/easylist/easyprivacy.txt"),
-                ("ublock-filters", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"),
-                ("ublock-privacy", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt"),
-                ("ublock-badware", "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt"),
-            ];
-            for (name, url) in LISTS {
-                let out = config::lists_dir().join(format!("{name}.txt"));
-                let ok = Command::new("curl.exe").args(["-fsSL", "-o"]).arg(&out).arg(url).status().is_ok_and(|s| s.success());
-                println!("{} {name}", if ok { "updated" } else { "FAILED " });
-            }
-        }
-        _ => println!(
-            "imc-browse [URL...]\n  --install-extension <id|file|url|folder>\n  --list-extensions\n  --remove-extension <name>\n  --update-lists"
-        ),
+    });
+    let end = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < end {
+        do_message_loop_work();
+        std::thread::sleep(Duration::from_millis(10));
     }
-    true
+    BROWSERS.with(|m| m.borrow_mut().clear());
+    shutdown();
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if cli(&args) {
-        return;
-    }
-    sandbox::contain_process_tree();
+    let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
+    let args = args::Args::new();
 
+    // Renderer/GPU/utility subprocesses are this same exe: they run here and return.
     let cfg = Config::load();
     updater::cleanup();
     // Secure DNS lives in the engine's Local State file; set it before the engine starts.
-    config::write_secure_dns(&config::profile_dir().join("EBWebView"), &cfg.doh);
-    vpn::start_watchdog(cfg.vpn.clone());
+    config::write_secure_dns(&config::root().join("cef-profile"), &cfg.doh);
+    let mut app = ImcApp::new(cfg.vpn.clone(), cfg.gestures.page_config(), cfg.hardware_acceleration);
+    let code = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
+    if code >= 0 {
+        std::process::exit(code);
+    }
 
-    let shield = Arc::new(Shield {
-        engine: Arc::new(RwLock::new(Arc::new(load_engine()))),
-        enabled: AtomicBool::new(cfg.adblock),
-        kill_switch: AtomicBool::new(cfg.vpn.enabled && cfg.vpn.kill_switch),
-        blocked: AtomicUsize::new(0),
-    });
+    vpn::start_watchdog(cfg.vpn.clone());
+    let cache = cs(&config::root().join("cef-profile").to_string_lossy());
+    let settings = Settings { no_sandbox: 1, root_cache_path: cache.clone(), cache_path: cache, ..Default::default() };
+    assert_eq!(initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()), 1);
 
     let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
-    let proxy = event_loop.create_proxy();
+    let tx = event_loop.create_proxy();
     let window = WindowBuilder::new()
-        .with_title("IMC Browse")
+        .with_title("IMC Browse (CEF)")
         .with_decorations(false)
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
         .build(&event_loop)
         .expect("window");
 
-    let browser_args = format!("{BASE_ARGS} --enable-features=StrictOriginIsolation{}{}", gpu_args(cfg.hardware_acceleration), vpn::browser_args(&cfg.vpn));
-    let p_ipc = proxy.clone();
-    let mut ctx = WebContext::new(Some(config::profile_dir()));
-    let size: LogicalSize<f64> = window.inner_size().to_logical(window.scale_factor());
-    let chrome = WebViewBuilder::new_with_web_context(&mut ctx)
-        .with_bounds(Rect {
-            position: LogicalPosition::new(0.0, 0.0).into(),
-            size: LogicalSize::new(size.width, size.height).into(),
-        })
-        .with_html(CHROME_HTML)
-        .with_additional_browser_args(browser_args.clone())
-        .with_browser_extensions_enabled(true)
-        .with_ipc_handler(move |r| {
-            let _ = p_ipc.send_event(Ev::Ipc(r.body().clone()));
-        })
-        .build_as_child(&window)
-        .expect("chrome ui");
+    // The chrome UI is a local file so it can be a normal page.
+    let ui_dir = config::root().join("ui");
+    let _ = std::fs::create_dir_all(&ui_dir);
+    let ui_file = ui_dir.join("chrome.html");
+    let _ = std::fs::write(&ui_file, CHROME_HTML);
+    let ui_url = format!("file:///{}", ui_file.to_string_lossy().replace('\\', "/"));
 
-    let mut app = App {
+    let size = window.inner_size();
+    let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() }.set_as_child(
+        sys::HWND(window.hwnd() as *mut _),
+        &Rect { x: 0, y: 0, width: size.width as i32, height: size.height as i32 },
+    );
+    let mut ui_client = Cl::new(UI_ID, tx.clone(), None);
+    let ui = browser_host_create_browser_sync(Some(&info), Some(&mut ui_client), Some(&cs(&ui_url)), Some(&BrowserSettings::default()), None, None)
+        .expect("chrome ui");
+    BROWSERS.with(|m| m.borrow_mut().insert(UI_ID, ui));
+
+    let engine = load_engine();
+    let css = engine.cosmetic_css();
+    let css_js = if css.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "(()=>{{const s=document.createElement('style');s.textContent={};(document.head||document.documentElement).appendChild(s)}})();",
+            Value::String(css)
+        )
+    };
+    let shield = Arc::new(Shield { engine, css_js, enabled: AtomicBool::new(cfg.adblock), blocked: AtomicUsize::new(0), kill_switch: cfg.vpn.enabled && cfg.vpn.kill_switch, gest: std::sync::RwLock::new(cfg.gestures.page_config()) });
+    let mut state = Shell {
         window,
-        chrome,
-        ctx,
-        private_ctx: None,
+        tx: tx.clone(),
         tabs: vec![],
         active: 0,
         next: 1,
         cfg: cfg.clone(),
-        proxy: proxy.clone(),
-        shield,
-        insecure_ok: Arc::new(Mutex::new(HashSet::new())),
-        args: browser_args,
         panel: false,
         bookmarks: bookmarks::load(),
+        ui_ready: false,
+        shield,
+        ghost_ctx: None,
         closed: vec![],
-        ext_items: ext::items(),
-        ext_ids: vec![],
-        sec: Default::default(),
-        downloads: downloads::load(),
-        dl_ids: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        last_dl_push: Instant::now(),
         upd: updater::Ctl::new(),
-        internal: Arc::new(RwLock::new(internal::Internal { webview: String::new(), flags: String::new(), hw: true, proxy: String::new(), doh: String::new(), ext_ids: vec![], gestures: cfg.gestures.clone() })),
     };
-    app.sync_internal();
-    // Dev hook: dump every imc:// page to disk so the styling can be reviewed without opening the app.
-    if let Some(dir) = std::env::var_os("IMC_DUMP_PAGES") {
-        let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::create_dir_all(&dir);
-        for name in ["", "version", "gpu", "extensions", "bookmarks", "blocker", "shortcuts"] {
-            if let Some(h) = internal::page(name, &app.internal.read().unwrap(), &app.shield) {
-                let _ = std::fs::write(dir.join(format!("{}.html", if name.is_empty() { "index" } else { name })), h);
-            }
-        }
-    }
-
-    // Tabs: CLI urls > restored session > home.
-    let _ = std::fs::remove_dir_all(config::private_root()); // leftovers from a crashed run
-    let mut urls: Vec<String> = args.iter().map(|a| normalize(a, &cfg.search_engine).0).collect();
+    let mut urls: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(|a| normalize(&a, &cfg.search_engine)).collect();
     let session = config::root().join("session.json");
     if urls.is_empty() {
-        if let Some(s) = std::fs::read_to_string(&session).ok().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()) {
-            urls = s;
+        if let Some(saved) = std::fs::read_to_string(&session).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()) {
+            urls = saved;
         }
     }
     let _ = std::fs::remove_file(&session);
-    if urls.is_empty() {
-        urls.push(cfg.home.clone());
-    }
+    let urls = if urls.is_empty() { vec![cfg.home.clone()] } else { urls };
     let mut first = 0;
     for u in &urls {
-        let id = app.new_tab(u, false);
+        let id = state.new_tab(u, false);
         if first == 0 {
             first = id;
         }
     }
-    app.activate(first);
-
-    // Dev hook: scripted UI commands so behaviour can be checked without touching the screen.
-    if std::env::var_os("IMC_SELFTEST").is_some() {
-        let t = proxy.clone();
-        let dirs: Vec<String> = ext::items().into_iter().map(|e| e.dir).collect();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(14));
-            for d in dirs {
-                let _ = t.send_event(Ev::Ipc(json!({"cmd": "ext_open", "dir": d}).to_string()));
-            }
-        });
-        // Certificate popup + clearing: set a cookie, read site info, clear cookies, clear site data.
-        let t3 = proxy.clone();
-        std::thread::spawn(move || {
-            let send = |ms: u64, v: Value| {
-                std::thread::sleep(Duration::from_millis(ms));
-                let _ = t3.send_event(Ev::Ipc(v.to_string()));
-            };
-            send(5000, json!({"cmd": "selftest_eval", "js": "document.cookie='imc_test=1; path=/'; document.cookie='imc_test2=2; path=/'; console.log(document.cookie)"}));
-            send(600, json!({"cmd": "site_info"}));
-            send(600, json!({"cmd": "site_clear", "kind": "cookies"}));
-            send(5000, json!({"cmd": "site_clear", "kind": "data"}));
-            send(1000, json!({"cmd": "site_clear", "kind": "cache"}));
-        });
-        // Zoom: two Ctrl+wheel notches in, one out, then Ctrl+0 via the keyboard shortcut.
-        let t4 = proxy.clone();
-        std::thread::spawn(move || {
-            let wheel = |dy: i32| format!("window.dispatchEvent(new WheelEvent('wheel',{{deltaY:{dy},ctrlKey:true,bubbles:true,cancelable:true}}))");
-            let key = "window.dispatchEvent(new KeyboardEvent('keydown',{key:'0',ctrlKey:true,bubbles:true,cancelable:true}))".to_string();
-            for (wait, js) in [(3000, wheel(-100)), (800, wheel(-100)), (800, wheel(100)), (1500, key)] {
-                std::thread::sleep(Duration::from_millis(wait));
-                let _ = t4.send_event(Ev::Ipc(json!({"cmd": "selftest_eval", "js": js}).to_string()));
-            }
-        });
-        // Which browser-internal pages does WebView2 let us open?
-        if let Ok(list) = std::env::var("IMC_SELFTEST_URLS") {
-            let t5 = proxy.clone();
-            let urls: Vec<String> = list.split(' ').map(String::from).collect();
-            std::thread::spawn(move || {
-                for u in urls {
-                    std::thread::sleep(Duration::from_secs(3));
-                    let _ = t5.send_event(Ev::Open(u));
-                }
-            });
-        }
-        // Synthetic right-button drags: D = new tab, UL = previous tab, UR = next tab, DR = close tab.
-        let t2 = proxy.clone();
-        std::thread::spawn(move || {
-            let drag = |pts: &str| format!("(()=>{{const p={pts};const ev=(t,x,y,b)=>window.dispatchEvent(new MouseEvent(t,{{button:2,buttons:b,clientX:x,clientY:y,bubbles:true,cancelable:true}}));ev('mousedown',p[0][0],p[0][1],2);for(const q of p.slice(1))ev('mousemove',q[0],q[1],2);const l=p[p.length-1];ev('mouseup',l[0],l[1],0)}})()");
-            for (wait, pts) in [(9, "[[200,200],[200,260],[200,320]]"), (4, "[[200,200],[200,140],[200,80],[140,80],[80,80]]"), (4, "[[200,200],[200,140],[200,80],[260,80],[320,80]]"), (4, "[[200,200],[200,260],[200,320],[260,320],[320,320]]")] {
-                std::thread::sleep(Duration::from_secs(wait));
-                let _ = t2.send_event(Ev::Ipc(json!({"cmd": "selftest_eval", "js": drag(pts)}).to_string()));
-            }
-        });
-    }
-    let p_tick = proxy.clone();
+    state.activate(first);
+    let p_tick = tx.clone();
     std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(3));
         if p_tick.send_event(Ev::Tick).is_err() {
             break;
         }
     });
 
+    // Dev hook: scripted UI commands so behaviour can be checked without touching the screen.
+    if std::env::var_os("IMC_SELFTEST").is_some() {
+        let t = tx.clone();
+        std::thread::spawn(move || {
+            let step = |ms: u64, cmd: &str| {
+                std::thread::sleep(Duration::from_millis(ms));
+                let _ = t.send_event(Ev::Ipc(cmd.to_string()));
+            };
+            step(3000, r#"{"cmd":"new","private":true}"#);
+            step(3000, r#"{"cmd":"new"}"#);
+            step(16000, r#"{"cmd":"switch","id":1}"#);
+            step(4000, r#"{"cmd":"close","id":3}"#);
+            step(7000, r#"{"cmd":"close","id":2}"#);
+        });
+    }
+
     event_loop.run(move |event, _, flow| {
-        *flow = ControlFlow::Wait;
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                app.save_session();
-                app.tabs.retain(|t| !t.private);
-                app.end_private_if_unused(true);
+                state.save_session();
+                finish();
                 *flow = ControlFlow::Exit;
+                return;
             }
             Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
-                app.layout();
-                app.push();
+                state.layout();
+                state.push();
             }
             Event::UserEvent(ev) => match ev {
-                Ev::Ipc(s) => app.ipc(&s, flow),
-                Ev::Url(id, u) => {
-                    if let Some(t) = app.tabs.iter_mut().find(|t| t.id == id) {
-                        t.url = internal::display(&u).unwrap_or(u);
+                Ev::Ipc(s) => {
+                    if state.ipc(&s) {
+                        finish();
+                        *flow = ControlFlow::Exit;
+                        return;
                     }
-                    app.apply_zoom(id);
-                    app.push();
+                }
+                Ev::Url(id, u) => {
+                    if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id && !t.frozen) {
+                        t.url = u;
+                    }
+                    state.apply_zoom(id);
+                    state.push();
                 }
                 Ev::Title(id, title) => {
-                    if let Some(t) = app.tabs.iter_mut().find(|t| t.id == id) {
+                    if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id && !t.frozen) {
                         t.title = title;
                     }
-                    app.push();
+                    state.push();
                 }
-                Ev::Load(id, started) => {
-                    if let Some(t) = app.tabs.iter_mut().find(|t| t.id == id) {
-                        t.loading = started;
+                Ev::Load(id, loading) => {
+                    if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id) {
+                        t.loading = loading;
                     }
-                    app.push();
+                    state.push();
                 }
                 Ev::Audio(id, on) => {
-                    if let Some(t) = app.tabs.iter_mut().find(|t| t.id == id) {
+                    if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id) {
                         t.audible = on;
                     }
-                    app.push();
-                }
-                Ev::Go(id, u) => app.go(id, &u),
-                Ev::Open(u) => {
-                    let private = app.tabs.iter().any(|t| t.id == app.active && t.private);
-                    let n = app.new_tab(&u, private);
-                    app.activate(n);
+                    state.push();
                 }
                 Ev::Tick => {
-                    app.tick();
-                    if (app.cfg.update.auto || app.cfg.update.nightly) && app.upd.due(app.cfg.update.last_check) {
-                        app.check_updates(false);
-                    }
-                    if std::env::var_os("IMC_SELFTEST").is_some() {
-                        let tabs: Vec<String> = app.tabs.iter().map(|t| format!("{}{}|{}|{}|z{}", if t.id == app.active { "*" } else { "" }, t.id, t.url, t.title, (t.zoom * 100.0).round())).collect();
-                        eprintln!("SELFTEST downloads {:?}", app.downloads.iter().map(|d| (d.name.clone(), d.state.clone(), d.received, d.total, d.path.clone())).collect::<Vec<_>>());
-                        eprintln!("SELFTEST tabs {tabs:?} ext_ids={:?} items={:?}", app.ext_ids, app.ext_items.iter().map(|e| (e.dir.clone(), e.name.clone(), e.icon.as_ref().map(|i| i.len()), e.popup.clone())).collect::<Vec<_>>());
-                    }
-                    if app.ext_ids.is_empty() && !app.ext_items.is_empty() {
-                        let p = app.proxy.clone();
-                        let _ = winhook::extension_ids(&app.chrome, move |ids| {
-                            let _ = p.send_event(Ev::ExtIds(ids));
-                        });
+                    state.tick();
+                    if (state.cfg.update.auto || state.cfg.update.nightly) && state.upd.due(state.cfg.update.last_check) {
+                        state.check_updates(false);
                     }
                 }
-                Ev::ExtIds(ids) => {
-                    app.ext_ids = ids;
-                    app.sync_internal();
-                }
-                Ev::Gesture(path) => app.gesture(&path, flow),
-                Ev::Download(e) => app.on_download(e),
-                Ev::Update(m) => app.on_update(m),
-                Ev::Zoom(d) => app.zoom_cmd(&d),
-                Ev::Security(id, j) => {
-                    app.sec.insert(id, j);
-                }
-                Ev::Toast(m) => {
-                    if std::env::var_os("IMC_SELFTEST").is_some() {
-                        eprintln!("SELFTEST toast {m}");
+                Ev::Zoom(d) => state.zoom_cmd(&d),
+                Ev::Update(m) => state.on_update(m),
+                Ev::Gesture(path) => {
+                    if state.gesture(&path) {
+                        finish();
+                        *flow = ControlFlow::Exit;
+                        return;
                     }
-                    app.toast(&m)
+                }
+                // The Ghost profile can only go once its last page has really finished closing.
+                Ev::Closed => {
+                    if !state.tabs.iter().any(|t| t.private) {
+                        state.ghost_ctx = None;
+                    }
+                }
+                Ev::Open(u) => {
+                    let private = state.tabs.iter().any(|t| t.id == state.active && t.private);
+                    let n = state.new_tab(&u, private);
+                    state.activate(n);
                 }
             },
             _ => {}
         }
+        // Pump CEF about 100 times a second (external message pump is a later optimisation).
+        do_message_loop_work();
+        *flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(10));
     });
 }

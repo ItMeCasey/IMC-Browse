@@ -1,8 +1,4 @@
-# Build output
 /target
-/cef/target
-# CEF runtime staged next to the exe (~400 MB, rebuilt by tools/stage-cef.ps1)
-/cef/dist
-# Scratch
+/dist
 /docs/zz-*
 *.log
