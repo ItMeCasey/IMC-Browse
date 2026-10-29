@@ -99,6 +99,26 @@
   }, true);
 })();
 
+// Extension stores: their own "Add to Chrome / Firefox" buttons need the real Chrome or Firefox, so on a
+// store page we add our own button that asks the browser to install that extension.
+(() => {
+  const h = location.hostname;
+  if (window.top !== window || (h !== 'chromewebstore.google.com' && h !== 'addons.mozilla.org')) return;
+  const isDetail = () => (h === 'chromewebstore.google.com' ? /\/detail\//.test(location.pathname) : /\/addon\//.test(location.pathname));
+  let btn = null;
+  const sync = () => {
+    if (!isDetail()) { if (btn) { btn.remove(); btn = null; } return; }
+    if (btn && btn.isConnected) return;
+    btn = document.createElement('button');
+    btn.textContent = 'Add to IMC Browse';
+    btn.style.cssText = 'position:fixed;top:76px;right:20px;z-index:2147483647;padding:10px 18px;border:0;border-radius:10px;background:#4da3ff;color:#06121f;font:600 14px system-ui,Segoe UI,sans-serif;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.35)';
+    btn.onclick = () => { console.debug('IMCEXT:' + location.href); btn.textContent = 'Installing...'; setTimeout(() => { if (btn) btn.textContent = 'Add to IMC Browse'; }, 4000); };
+    document.documentElement.appendChild(btn);
+  };
+  setInterval(sync, 700);
+  sync();
+})();
+
 // Link hover bubble (bottom-left, full URL). WebView2 draws its own status bubble, so this only
 // runs where the engine has none (the CEF build).
 (() => {

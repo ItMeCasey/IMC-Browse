@@ -171,6 +171,42 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
 .act{border:0;border-radius:8px;background:var(--acc);color:#fff;padding:7px 14px;cursor:pointer}
 .sec{border:1px solid var(--line);border-radius:8px;background:var(--tab);padding:6px 12px;cursor:pointer}
 .note{color:var(--dim);font-size:12px;margin:8px 0}
+#ext_list{display:grid;gap:10px;margin:6px 0 4px}
+.extcard{display:flex;align-items:center;gap:14px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--tab);transition:border-color .15s,opacity .15s}
+.extcard:hover{border-color:color-mix(in srgb,var(--acc),var(--line) 60%)}
+.extcard.off{opacity:.62}
+.exticon{width:46px;height:46px;border-radius:11px;background:var(--bg);display:flex;align-items:center;justify-content:center;flex:0 0 auto;color:var(--dim)}
+.exticon img{width:30px;height:30px;border-radius:5px}
+.extbody{flex:1 1 auto;min-width:0}
+.extname{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.extmeta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:5px;font-size:11.5px;color:var(--dim)}
+.tag{padding:1px 8px;border-radius:999px;background:color-mix(in srgb,var(--fg),transparent 90%);line-height:17px}
+.tag.cr{color:#6aa9ff}.tag.ff{color:#ff9f43}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);display:inline-block;margin-right:5px}
+.dot.off{background:var(--dim)}.dot.bad{background:var(--bad)}
+.exterr{margin-top:4px;font-size:11.5px;color:var(--bad)}
+.extacts{display:flex;align-items:center;gap:4px;flex:0 0 auto}
+.ghost{border:0;background:transparent;color:var(--dim);padding:6px 9px;border-radius:8px;display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+.ghost:hover{background:color-mix(in srgb,var(--fg),transparent 88%);color:var(--fg)}
+.ghost.danger:hover,.ghost.sure{color:var(--bad)}
+.extempty{display:flex;flex-direction:column;align-items:center;gap:6px;padding:26px 16px;border:1px dashed var(--line);border-radius:12px;color:var(--dim);text-align:center}
+.extempty b{color:var(--fg);font-size:14px}
+.extempty svg{width:30px;height:30px;opacity:.7}
+.stores{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:8px 0 14px}
+.store{display:flex;align-items:center;gap:12px;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--tab);cursor:pointer;text-align:left;transition:transform .12s,border-color .12s}
+.store:hover{transform:translateY(-1px);border-color:var(--acc)}
+.store .sb{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;flex:0 0 auto}
+.store.cr .sb{background:linear-gradient(135deg,#4285f4,#34a853)}
+.store.ff .sb{background:linear-gradient(135deg,#ff9400,#ff3750)}
+.store b{display:block;font-size:13.5px}
+.store span.d{display:block;font-size:11.5px;color:var(--dim);margin-top:2px}
+.store .go{margin-left:auto;color:var(--dim)}
+.ibar{display:flex;gap:8px;margin:8px 0}
+.ibar input{flex:1;min-width:0;padding:9px 12px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+.ibar input:focus{outline:2px solid color-mix(in srgb,var(--acc),transparent 55%);border-color:var(--acc)}
+.banner{display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:10px;background:color-mix(in srgb,var(--acc),transparent 86%);border:1px solid color-mix(in srgb,var(--acc),transparent 60%);margin:10px 0}
+.banner span{flex:1}
+#s-extensions .sub{color:var(--dim);margin:-6px 0 10px}
 .switch{position:relative;display:inline-block;width:42px;height:24px;flex:0 0 auto}
 .switch input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer;z-index:1}
 .switch i{position:absolute;inset:0;border-radius:12px;background:var(--line);transition:background .15s}
@@ -287,13 +323,17 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
 
     <section id="s-extensions">
       <h2>Extensions</h2>
+      <p class="sub" id="ext_count"></p>
       <div id="ext_list"></div>
-      <p class="note" id="ext_restart" style="display:none">Changes apply after a restart. <button class="sec inl" id="ext_restart_btn"></button></p>
-      <h3>Get more</h3>
-      <div class="tools"><button class="act inl" id="ext_cws">Chrome Web Store</button><button class="act inl" id="ext_amo">Firefox Add-ons</button></div>
-      <label class="row">Install from an address or file<input type="text" id="ext_src" placeholder="Store page address, extension id, .crx / .xpi / .zip, or folder"></label>
-      <div class="tools"><button class="sec inl" id="ext_install">Install</button></div>
-      <p class="note">Open a store, find an extension, then paste its page address above. Chrome and Firefox extensions both work; older ones are converted to the current format, which works for most but not all. Installs, removals and switching off need a restart.</p>
+      <div class="banner" id="ext_restart" style="display:none"><span>Restart the browser to apply your changes.</span><button class="act inl" id="ext_restart_btn"></button></div>
+      <h3>Get more extensions</h3>
+      <div class="stores">
+        <button class="store cr" id="ext_cws"><div class="sb" id="ext_cws_ic"></div><div><b>Chrome Web Store</b><span class="d">Thousands of Chrome extensions</span></div><span class="go" id="ext_cws_go"></span></button>
+        <button class="store ff" id="ext_amo"><div class="sb" id="ext_amo_ic"></div><div><b>Firefox Add-ons</b><span class="d">Add-ons made for Firefox</span></div><span class="go" id="ext_amo_go"></span></button>
+      </div>
+      <h3>Install from an address or file</h3>
+      <div class="ibar"><input type="text" id="ext_src" spellcheck="false" placeholder="Paste a store page address, extension id, .crx / .xpi / .zip, or a folder"><button class="act" id="ext_install">Install</button></div>
+      <p class="note">On a store page, an <b>Add to IMC Browse</b> button appears; you can also paste the page address here. Older extensions are converted to the current format, which works for most but not all. Installing, removing and turning off need a restart.</p>
     </section>
 
     <section id="s-updates">
@@ -700,6 +740,7 @@ $('p_hw').onchange=()=>{send({cmd:'hwaccel',enabled:$('p_hw').checked});$('hw_re
 $('hw_restart').onclick=()=>send({cmd:'restart'});
 $('up_check').innerHTML=gl('reload',14)+'<span>Check now</span>';
 $('h_on').onchange=()=>send({cmd:'history_prefs',on:$('h_on').checked});$('h_open').onclick=()=>send({cmd:'history_open'});$('h_clear').onclick=()=>send({cmd:'history_clear',range:$('h_range').value});
+$('ext_cws_ic').innerHTML=gl('extension',20);$('ext_amo_ic').innerHTML=gl('extension',20);$('ext_cws_go').innerHTML=gl('external',16);$('ext_amo_go').innerHTML=gl('external',16);
 $('ext_cws').onclick=()=>{panel(false);send({cmd:'ext_store',which:'chrome'})};$('ext_amo').onclick=()=>{panel(false);send({cmd:'ext_store',which:'firefox'})};
 $('ext_install').onclick=()=>{const v=$('ext_src').value.trim();if(v){send({cmd:'ext_install',src:v});$('ext_src').value='';$('ext_restart').style.display=''}};
 $('ext_restart_btn').innerHTML=gl('reload',14)+'<span>Restart now</span>';$('ext_restart_btn').onclick=()=>send({cmd:'restart'});
@@ -746,23 +787,34 @@ function drawCreds(){
 
 function drawExtensions(list){
   const box=$('ext_list');if(!box)return;box.textContent='';
-  if(!list.length){const p=document.createElement('p');p.className='note';p.textContent='No extensions installed yet.';box.append(p);return}
+  $('ext_count').textContent=list.length?(list.length===1?'1 extension installed':list.length+' extensions installed'):'';
+  if(!list.length){
+    const e=document.createElement('div');e.className='extempty';
+    e.innerHTML=gl('extension',30)+'<b>No extensions yet</b><span>Browse a store below and add one. It shows up here.</span>';
+    box.append(e);return;
+  }
+  const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;if(x!=null)n.textContent=x;return n};
   for(const e of list){
-    const row=document.createElement('div');row.className='row';row.style.cssText='flex-wrap:wrap;gap:8px;align-items:center'+(e.disabled?';opacity:.6':'');
-    const ic=document.createElement('span');ic.style.cssText='width:24px;height:24px;display:inline-flex';ic.innerHTML=e.icon?'<img alt="" style="width:24px;height:24px" src="'+e.icon+'">':gl('extension',20);
-    const t=document.createElement('span');t.style.flex='1 1 200px';
-    const b=document.createElement('b');b.textContent=e.name;t.append(b);
-    const sub=document.createElement('div');sub.style.cssText='font-size:12px;color:var(--dim)';
-    sub.textContent=(e.firefox?'Firefox':'Chrome')+(e.version?' · v'+e.version:'')+(e.disabled?' · Off':e.error?' · Not loaded: '+e.error:' · On');t.append(sub);
-    row.append(ic,t);
-    const sw=document.createElement('label');sw.className='switch';sw.title=e.disabled?'Turn on':'Turn off';
+    const card=el('div','extcard'+(e.disabled?' off':''));
+    const ic=el('div','exticon');ic.innerHTML=e.icon?'<img alt="" src="'+e.icon+'">':gl('extension',24);
+    const body=el('div','extbody');
+    body.append(el('div','extname',e.name));
+    const meta=el('div','extmeta');
+    meta.append(el('span','tag '+(e.firefox?'ff':'cr'),e.firefox?'Firefox':'Chrome'));
+    if(e.version)meta.append(el('span','',' v'+e.version));
+    const st=el('span','');const d=el('i','dot'+(e.disabled?' off':e.error?' bad':''));st.append(d,document.createTextNode(e.disabled?'Off':e.error?'Not loaded':'On'));
+    meta.append(st);body.append(meta);
+    if(e.error&&!e.disabled)body.append(el('div','exterr',e.error));
+    const acts=el('div','extacts');
+    if(e.options&&!e.disabled&&!e.error){const o=el('button','ghost');o.innerHTML=gl('sliders',15)+'<span>Options</span>';o.onclick=()=>{panel(false);send({cmd:'ext_open',dir:e.dir,page:'options'})};acts.append(o)}
+    const r=el('button','ghost danger');r.innerHTML=gl('trash',15)+'<span>Remove</span>';
+    r.onclick=()=>{if(r.dataset.sure){send({cmd:'ext_remove',dir:e.dir});$('ext_restart').style.display=''}else{r.dataset.sure=1;r.classList.add('sure');r.querySelector('span').textContent='Sure?';setTimeout(()=>{delete r.dataset.sure;r.classList.remove('sure');const sp=r.querySelector('span');if(sp)sp.textContent='Remove'},3500)}};
+    acts.append(r);
+    const sw=el('label','switch');sw.title=e.disabled?'Turn on':'Turn off';
     const cb=document.createElement('input');cb.type='checkbox';cb.checked=!e.disabled;
     cb.onchange=()=>{send({cmd:'ext_enable',dir:e.dir,on:cb.checked});$('ext_restart').style.display=''};
-    sw.append(cb,document.createElement('i'));row.append(sw);
-    if(e.options&&!e.disabled&&!e.error){const o=document.createElement('button');o.className='sec inl';o.textContent='Options';o.onclick=()=>{panel(false);send({cmd:'ext_open',dir:e.dir,page:'options'})};row.append(o)}
-    const r=document.createElement('button');r.className='sec inl';r.textContent='Remove';
-    r.onclick=()=>{if(r.dataset.sure){send({cmd:'ext_remove',dir:e.dir});$('ext_restart').style.display=''}else{r.dataset.sure=1;r.textContent='Click again to remove';setTimeout(()=>{delete r.dataset.sure;r.textContent='Remove'},4000)}};
-    row.append(r);box.append(row);
+    sw.append(cb,document.createElement('i'));acts.append(sw);
+    card.append(ic,body,acts);box.append(card);
   }
 }
 

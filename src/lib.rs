@@ -100,6 +100,8 @@ enum Ev {
     Hist(String),
     /// The set of installed extensions changed (an install finished).
     ExtChanged,
+    /// A store page asked to install the extension it is showing (its address).
+    ExtInstall(String),
     Tick,
     /// A browser finished closing (safe to release anything it was using).
     Closed,
@@ -194,6 +196,13 @@ wrap_display_handler! {
         fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, src: Option<&CefString>, _line: i32) -> i32 {
             if !is_ui(self.id) {
                 if let Some(m) = msg.map(|m| m.to_string()) {
+                    if let Some(u) = m.strip_prefix("IMCEXT:") {
+                        // Only the stores' own pages may ask for an install.
+                        if src.map(|s| s.to_string()).is_some_and(|s| s.starts_with("https://chromewebstore.google.com/") || s.starts_with("https://addons.mozilla.org/")) {
+                            let _ = self.tx.send_event(Ev::ExtInstall(u.to_string()));
+                        }
+                        return 1;
+                    }
                     if let Some(c) = m.strip_prefix("IMCHIST:") {
                         // Only our own history page may change the history, never a website.
                         if src.map(|s| s.to_string()).is_some_and(|s| s.starts_with("imc://history")) {
@@ -2995,6 +3004,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
                     state.apply_zoom(id);
                     state.push();
                 }
+                Ev::ExtInstall(url) => state.ipc(&json!({"cmd": "ext_install", "src": url}).to_string()).then_some(()).unwrap_or(()),
                 Ev::ExtChanged => {
                     state.ext_items = ext::items();
                     state.push();
