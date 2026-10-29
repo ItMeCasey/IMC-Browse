@@ -33,7 +33,7 @@ jobs:
           echo "$plan"
       - name: Already built?
         id: seen
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .nightly-marker
           key: nightly-${{ steps.c.outputs.marker }}
@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "${{ needs.check.outputs.marker }}" > .nightly-marker
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         with:
           path: .nightly-marker
           key: nightly-${{ needs.check.outputs.marker }}
