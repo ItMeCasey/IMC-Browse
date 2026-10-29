@@ -109,10 +109,11 @@
   const show = (url) => {
     if (!el) {
       el = document.createElement('div');
-      el.style.cssText = 'position:fixed;left:0;bottom:0;max-width:62vw;padding:4px 12px 5px 10px;border-radius:0 8px 0 0;background:rgba(28,31,37,.96);color:#e6e8ec;border:1px solid rgba(255,255,255,.12);border-left:0;border-bottom:0;font:12px/1.35 system-ui,Segoe UI,sans-serif;word-break:break-all;z-index:2147483647;pointer-events:none';
+      el.style.cssText = 'position:fixed;left:0;bottom:0;max-width:62vw;padding:4px 12px 5px 10px;border-radius:0 8px 0 0;background:rgba(28,31,37,.96);color:#e6e8ec;border:1px solid rgba(255,255,255,.12);border-left:0;border-bottom:0;font:12px/1.35 system-ui,Segoe UI,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;z-index:2147483647;pointer-events:none';
       document.documentElement.appendChild(el);
     }
-    el.textContent = url;
+    // long tracking links: keep the start (the site) and the end, drop the middle
+    el.textContent = url.length > 110 ? url.slice(0, 75) + ' … ' + url.slice(-25) : url;
   };
   const link = (t) => (t && t.closest ? t.closest('a[href]') : null);
   addEventListener('mouseover', (e) => {
