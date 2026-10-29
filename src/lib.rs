@@ -909,6 +909,55 @@ unsafe extern "system" fn paint_guard(hwnd: HWND, msg: u32, wp: windows::Win32::
     unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wp, lp) }
 }
 
+thread_local! {
+    /// True while CEF's message pump runs inside tao's event handler.
+    static IN_PUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Messages for tao's hidden thread window that arrived during the pump, delivered right after it.
+    static DEFERRED: std::cell::RefCell<Vec<(isize, u32, usize, isize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// tao's hidden thread window gets "process new events" messages that make tao call our event handler
+/// directly. CEF's pump (which runs inside that handler) can dispatch one, and tao then panics with
+/// "event handler is re-entrant", aborting the browser. Hold such messages until the pump is done.
+unsafe extern "system" fn defer_guard(hwnd: HWND, msg: u32, wp: windows::Win32::Foundation::WPARAM, lp: windows::Win32::Foundation::LPARAM, _id: usize, _data: usize) -> windows::Win32::Foundation::LRESULT {
+    if msg >= 0x400 && IN_PUMP.with(|c| c.get()) {
+        DEFERRED.with(|d| d.borrow_mut().push((hwnd.0 as isize, msg, wp.0, lp.0)));
+        return windows::Win32::Foundation::LRESULT(0);
+    }
+    unsafe { windows::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wp, lp) }
+}
+
+/// Finds tao's hidden thread window and puts the guard on it.
+fn guard_tao_thread_window() {
+    use windows::Win32::UI::WindowsAndMessaging::{EnumThreadWindows, GetClassNameW};
+    unsafe extern "system" fn each(hwnd: HWND, _l: windows::Win32::Foundation::LPARAM) -> windows::core::BOOL {
+        let mut name = [0u16; 64];
+        let n = unsafe { GetClassNameW(hwnd, &mut name) } as usize;
+        if String::from_utf16_lossy(&name[..n]) == "Tao Thread Event Target" {
+            unsafe {
+                let _ = windows::Win32::UI::Shell::SetWindowSubclass(hwnd, Some(defer_guard), 2, 0);
+            }
+        }
+        true.into()
+    }
+    unsafe {
+        let _ = EnumThreadWindows(windows::Win32::System::Threading::GetCurrentThreadId(), Some(each), windows::Win32::Foundation::LPARAM(0));
+    }
+}
+
+/// Runs one turn of CEF's loop without letting tao's own messages re-enter its handler.
+fn pump_cef() {
+    IN_PUMP.with(|c| c.set(true));
+    do_message_loop_work();
+    IN_PUMP.with(|c| c.set(false));
+    let held: Vec<_> = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for (h, m, w, l) in held {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(HWND(h as *mut _)), m, windows::Win32::Foundation::WPARAM(w), windows::Win32::Foundation::LPARAM(l));
+        }
+    }
+}
+
 fn build_window(target: &tao::event_loop::EventLoopWindowTarget<Ev>, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) -> Window {
     let mut b = WindowBuilder::new().with_title("IMC Browse (CEF)").with_decorations(false);
     b = match size {
@@ -2691,6 +2740,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
     let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
     let tx = event_loop.create_proxy();
     let window = build_window(&event_loop, None, None);
+    guard_tao_thread_window();
 
     // The chrome UI is a local file so it can be a normal page.
     let ui_dir = config::root().join("ui");
@@ -3022,7 +3072,7 @@ fn run(sandbox_info: *mut std::ffi::c_void) {
             }
         }
         // Pump CEF about 100 times a second (external message pump is a later optimisation).
-        do_message_loop_work();
+        pump_cef();
         *flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(10));
     });
 }
