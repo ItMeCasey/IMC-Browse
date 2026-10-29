@@ -9,8 +9,9 @@ pub fn contain_process_tree() {
     unsafe {
         let Ok(job) = CreateJobObjectW(None, None) else { return };
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        // Kill every child when the browser exits; forbid escaping the job.
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Kill every child when the browser exits. Only a process started with CREATE_BREAKAWAY_FROM_JOB
+        // (the restart helper) may leave the job.
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         if SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,

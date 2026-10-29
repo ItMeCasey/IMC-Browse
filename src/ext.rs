@@ -67,6 +67,9 @@ pub fn list() -> Vec<(String, String, String)> {
     let mut out = vec![];
     if let Ok(rd) = fs::read_dir(extensions_dir()) {
         for e in rd.flatten() {
+            if e.path().join(REMOVED_MARK).exists() {
+                continue;
+            }
             if let Some(m) = read_manifest(&e.path()) {
                 out.push((
                     e.file_name().to_string_lossy().into_owned(),
@@ -84,7 +87,22 @@ pub fn remove(name: &str) -> Result<(), String> {
     if !dir.is_dir() {
         return Err(format!("no such extension: {name}"));
     }
-    fs::remove_dir_all(dir).map_err(|e| e.to_string())
+    // The engine still has the extension loaded: pulling its files away makes it open a window of its own.
+    // Hide it now and delete it on the next start.
+    fs::write(dir.join(REMOVED_MARK), b"").map_err(|e| e.to_string())
+}
+
+const REMOVED_MARK: &str = ".imc-removed";
+
+/// Deletes extensions removed in an earlier run. Called before the engine starts.
+pub fn purge_removed() {
+    if let Ok(rd) = fs::read_dir(extensions_dir()) {
+        for e in rd.flatten() {
+            if e.path().join(REMOVED_MARK).exists() {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+    }
 }
 
 fn download(url: &str) -> Result<Vec<u8>, String> {
@@ -405,6 +423,7 @@ pub fn set_enabled(dir: &str, on: bool) -> Result<(), String> {
 
 pub fn load_dirs() -> (Vec<String>, Vec<(String, String)>) {
     let (mut ok, mut skipped) = (vec![], vec![]);
+    purge_removed();
     if let Ok(rd) = fs::read_dir(extensions_dir()) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -526,6 +545,9 @@ pub fn items() -> Vec<Item> {
     let mut out = vec![];
     if let Ok(rd) = fs::read_dir(extensions_dir()) {
         for e in rd.flatten() {
+            if e.path().join(REMOVED_MARK).exists() {
+                continue;
+            }
             let Some(m) = read_manifest(&e.path()) else { continue };
             let dir = e.file_name().to_string_lossy().into_owned();
             let act = if m["action"].is_object() { &m["action"] } else { &m["browser_action"] };

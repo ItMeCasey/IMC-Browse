@@ -1392,8 +1392,8 @@ impl Shell {
         if let Ok(exe) = std::env::current_exe() {
             use std::os::windows::process::CommandExt;
             let _ = std::process::Command::new(sandbox::system_exe("cmd.exe"))
-                .raw_arg(format!("/C timeout /t 3 /nobreak >nul & start \"\" \"{}\"", exe.display()))
-                .creation_flags(0x0800_0000)
+                .raw_arg(format!("/C ping -n 4 127.0.0.1 >nul & start \"\" \"{}\"", exe.display()))
+                .creation_flags(0x0800_0000 | 0x0100_0000) // no window, outside the job so it outlives us
                 .spawn();
         }
     }
