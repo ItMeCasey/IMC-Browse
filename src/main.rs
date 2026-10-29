@@ -790,6 +790,7 @@ struct Shell {
     /// The AI panel is showing (it is created on first use and kept alive after that).
     ext_items: Vec<ext::Item>,
     default_asked: bool,
+    last_session: Instant,
     ai_open: bool,
     control_on: Arc<AtomicBool>,
     /// Text waiting for the panel's page to finish loading.
@@ -828,7 +829,7 @@ fn normalize(t: &str, engine: &str) -> String {
         return u;
     }
     let lower = t.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("file://") {
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("file://") || lower.starts_with("chrome-extension://") || lower.starts_with("imc://") {
         return t.into();
     }
     if !t.contains(' ') && !t.contains("://") && (t.contains('.') || lower.starts_with("localhost")) && !t.starts_with('.') {
@@ -910,8 +911,15 @@ impl Shell {
     }
 
     fn save_session(&self) {
-        let urls: Vec<&str> = self.tabs.iter().filter(|t| !t.private).map(|t| t.url.as_str()).filter(|u| u.starts_with("http")).collect();
-        let _ = std::fs::write(config::root().join("session.json"), serde_json::to_string(&urls).unwrap());
+        let path = config::root().join("session.json");
+        if !self.cfg.restore_tabs {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        let saved: Vec<&Tab> = self.tabs.iter().filter(|t| !t.private && t.url.starts_with("http")).collect();
+        let urls: Vec<&str> = saved.iter().map(|t| t.url.as_str()).collect();
+        let active = saved.iter().position(|t| t.id == self.active).unwrap_or(0);
+        let _ = std::fs::write(path, json!({"tabs": urls, "active": active}).to_string());
     }
 
     fn relaunch(&self) {
@@ -1615,6 +1623,7 @@ impl Shell {
             "cfg": self.cfg,
             "extensions": [],
             "maximized": self.window.is_maximized(),
+            "restore_tabs": self.cfg.restore_tabs,
             "default_browser": {"is_default": defaultbrowser::is_default(), "check": self.cfg.default_check},
             "ai": {"open": self.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
             "extensions": self.ext_items.iter().map(|e| json!({"dir": e.dir, "name": e.name, "icon": e.icon, "popup": e.popup.is_some() || e.options.is_some(), "error": e.error})).collect::<Vec<_>>(),
@@ -1949,6 +1958,12 @@ impl Shell {
             }
             "dl_folder" => downloads::open_folder(&downloads::dir()),
             "update_state" => self.push_update(),
+            "restore_prefs" => {
+                self.cfg.restore_tabs = m["on"].as_bool().unwrap_or(true);
+                self.cfg.save();
+                self.save_session();
+                self.push();
+            }
             "default_set" => defaultbrowser::open_settings(),
             "default_ignore" => {
                 self.cfg.default_check = false;
@@ -2291,6 +2306,7 @@ fn main() {
         internal,
         ext_items: ext::items(),
         default_asked: false,
+        last_session: Instant::now(),
         ai_open: false,
         control_on: Arc::new(AtomicBool::new(cfg.control.enabled)),
         ai_pending: None,
@@ -2298,22 +2314,25 @@ fn main() {
         downloads,
         last_dl_push: Instant::now(),
     };
-    let mut urls: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(|a| normalize(&a, &cfg.search_engine)).collect();
-    let session = config::root().join("session.json");
-    if urls.is_empty() {
-        if let Some(saved) = std::fs::read_to_string(&session).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()) {
-            urls = saved;
+    let requested: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(|a| normalize(&a, &cfg.search_engine)).collect();
+    let (mut urls, mut active) = (Vec::<String>::new(), 0usize);
+    if cfg.restore_tabs {
+        if let Some(v) = std::fs::read_to_string(config::root().join("session.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+            urls = v["tabs"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            active = v["active"].as_u64().unwrap_or(0) as usize;
         }
     }
-    let _ = std::fs::remove_file(&session);
+    if !requested.is_empty() {
+        // Links opened from outside (default browser) come in front of the restored tabs.
+        active = urls.len();
+        urls.extend(requested);
+    }
     let urls = if urls.is_empty() { vec![cfg.home.clone()] } else { urls };
-    let mut first = 0;
+    let mut ids = vec![];
     for u in &urls {
-        let id = state.new_tab(u, false);
-        if first == 0 {
-            first = id;
-        }
+        ids.push(state.new_tab(u, false));
     }
+    let first = ids[active.min(ids.len() - 1)];
     state.sync_internal();
     {
         let tx_ctl = tx.clone();
@@ -2448,6 +2467,10 @@ fn main() {
                 }
                 Ev::Tick => {
                     state.tick();
+                    if state.last_session.elapsed() > Duration::from_secs(10) {
+                        state.last_session = Instant::now();
+                        state.save_session();
+                    }
                     if (state.cfg.update.auto || state.cfg.update.nightly) && state.upd.due(state.cfg.update.last_check) {
                         state.check_updates(false);
                     }

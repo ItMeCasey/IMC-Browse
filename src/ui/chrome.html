@@ -245,6 +245,8 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
     <section id="s-general" class="on">
       <h2>General</h2>
       <label class="row">Vertical tabs (sidebar)<input type="checkbox" id="p_vert"></label>
+      <label class="row">Reopen my tabs when the browser starts<span class="switch"><input type="checkbox" id="p_restore"><i></i></span></label>
+      <p class="note">Brings back the tabs you had open (not Ghost tabs), including after a crash or restart.</p>
       <label class="row">Default browser<span id="def_state" style="color:var(--dim)"></span><button class="sec inl" id="def_set">Make default</button></label>
       <label class="row">Ask at startup when not the default<span class="switch"><input type="checkbox" id="def_check"><i></i></span></label>
       <p class="note">Windows only lets you pick your default browser yourself: "Make default" opens that Windows page, where you choose IMC Browse.</p>
@@ -679,6 +681,7 @@ $('hw_restart').innerHTML=gl('reload',14)+'<span>Restart now</span>';
 $('p_hw').onchange=()=>{send({cmd:'hwaccel',enabled:$('p_hw').checked});$('hw_restart').style.display='inline-flex'};
 $('hw_restart').onclick=()=>send({cmd:'restart'});
 $('up_check').innerHTML=gl('reload',14)+'<span>Check now</span>';
+$('p_restore').onchange=()=>send({cmd:'restore_prefs',on:$('p_restore').checked});
 $('def_set').onclick=()=>send({cmd:'default_set'});$('def_check').onchange=()=>send({cmd:'default_prefs',check:$('def_check').checked});
 $('up_check').onclick=()=>send({cmd:'update_check'});
 const sendUpd=()=>send({cmd:'update_prefs',auto:$('up_auto').checked,nightly:$('up_nightly').checked});
@@ -748,6 +751,7 @@ window.ui={
   const a=s.tabs.find(t=>t.id===s.active);
   document.body.classList.toggle('ghost',!!(a&&a.private));
   renderToolbar();
+  $('p_restore').checked=s.restore_tabs!==false;
   if(s.default_browser){$('def_state').textContent=s.default_browser.is_default?'IMC Browse is your default':'Not your default';$('def_set').style.display=s.default_browser.is_default?'none':'';$('def_check').checked=s.default_browser.check}
   if(s.ai){
     document.body.classList.toggle('ai',!!s.ai.open);document.documentElement.style.setProperty('--ai-w',s.ai.width+'px');

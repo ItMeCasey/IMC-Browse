@@ -18,6 +18,8 @@ pub struct Config {
     pub hardware_acceleration: bool,
     /// Ask at startup when IMC Browse is not the default browser. "Don't ask again" turns this off.
     pub default_check: bool,
+    /// Reopen the tabs that were open when the browser last closed (Ghost tabs are never saved).
+    pub restore_tabs: bool,
     /// Items on either side of the address bar, by id (see the TB_DEFS table in chrome.html).
     pub toolbar: Toolbar,
     pub gestures: Gestures,
@@ -314,6 +316,7 @@ impl Default for Config {
             vertical_tabs: false,
             hardware_acceleration: true,
             default_check: true,
+            restore_tabs: true,
             toolbar: Toolbar::default(),
             gestures: Gestures::default(),
             zoom: HashMap::new(),
