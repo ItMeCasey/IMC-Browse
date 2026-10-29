@@ -49,6 +49,10 @@ const TABSTRIP_H: f64 = 36.0;
 const SIDEBAR_W: f64 = 230.0;
 const TITLEBAR_H: f64 = 32.0;
 const UI_ID: usize = 0;
+/// The AI side panel's browser (not a tab).
+const AI_ID: usize = usize::MAX - 1;
+const AI_HEAD_H: f64 = 40.0;
+const AI_GAP: f64 = 6.0;
 
 /// Download progress, as reported by CEF's download handler.
 pub enum DlEvent {
@@ -66,6 +70,8 @@ enum Ev {
     Audio(usize, bool),
     /// A drawn gesture path (U/D/L/R) reported by a page.
     Gesture(String),
+    /// Text of the active page (or its selection), requested by "Send page".
+    PageText { title: String, url: String, text: String, selected: bool },
     /// A page announced its icon(s); we fetch the first.
     FaviconUrl(usize, String),
     /// The icon, as a ready-to-show data: URI (tab id, icon url).
@@ -169,6 +175,17 @@ wrap_display_handler! {
         fn on_console_message(&self, _b: Option<&mut Browser>, _l: LogSeverity, msg: Option<&CefString>, _s: Option<&CefString>, _line: i32) -> i32 {
             if self.id != UI_ID {
                 if let Some(m) = msg.map(|m| m.to_string()) {
+                    if let Some(t) = m.strip_prefix("SELFTEST_AI:") {
+                        eprintln!("SELFTEST ai chat box now holds: {t}");
+                        return 1;
+                    }
+                    if let Some(j) = m.strip_prefix("IMCTXT:") {
+                        if let Ok(v) = serde_json::from_str::<Value>(j) {
+                            let g = |k: &str| v[k].as_str().unwrap_or("").to_string();
+                            let _ = self.tx.send_event(Ev::PageText { title: g("title"), url: g("url"), text: g("text"), selected: v["selected"].as_bool().unwrap_or(false) });
+                        }
+                        return 1;
+                    }
                     if let Some(u) = m.strip_prefix("IMCFAV:") {
                         let _ = self.tx.send_event(Ev::FaviconUrl(self.id, u.to_string()));
                         return 1;
@@ -719,6 +736,10 @@ struct Shell {
     upd: updater::Ctl,
     /// Live data behind the imc:// pages.
     internal: Arc<RwLock<internal::Internal>>,
+    /// The AI panel is showing (it is created on first use and kept alive after that).
+    ai_open: bool,
+    /// Text waiting for the panel's page to finish loading.
+    ai_pending: Option<String>,
     downloads: Vec<downloads::Item>,
     dl_ids: Arc<AtomicU64>,
     last_dl_push: Instant,
@@ -862,10 +883,59 @@ impl Shell {
         let s = self.window.inner_size();
         place(UI_ID, 0, 0, s.width as i32, s.height as i32, true);
         let r = self.content_rect();
+        let k = self.window.scale_factor();
+        let ai_on = self.ai_open && self.cfg.ai.enabled && !self.panel;
+        // the panel takes the right side; a gap keeps the drag handle (drawn by the chrome UI) visible
+        let pw = if ai_on { ((self.cfg.ai.width_clamped() as f64 * k) as i32).min((r.width - (320.0 * k) as i32).max(0)) } else { 0 };
+        let gap = if ai_on { (AI_GAP * k) as i32 } else { 0 };
+        let page_w = (r.width - pw - gap).max(0);
         for t in &self.tabs {
             let show = t.id == self.active && !self.panel;
-            place(t.id, r.x, r.y, r.width, r.height, show);
+            place(t.id, r.x, r.y, page_w, r.height, show);
         }
+        let head = (AI_HEAD_H * k) as i32;
+        place(AI_ID, r.x + r.width - pw, r.y + head, pw, (r.height - head).max(0), ai_on);
+    }
+
+    /// Creates the AI panel's browser the first time it is needed (shares the normal login session).
+    fn ensure_ai(&mut self) {
+        let exists = BROWSERS.with(|m| m.borrow().contains_key(&AI_ID));
+        if exists {
+            return;
+        }
+        if let Some(url) = self.cfg.ai.url() {
+            self.spawn(AI_ID, &url, false);
+        }
+    }
+
+    fn ai_navigate(&mut self) {
+        let Some(url) = self.cfg.ai.url() else { return };
+        let exists = BROWSERS.with(|m| m.borrow().contains_key(&AI_ID));
+        if !exists {
+            self.ensure_ai();
+        } else {
+            BROWSERS.with(|m| {
+                if let Some(f) = m.borrow().get(&AI_ID).and_then(|b| b.main_frame()) {
+                    f.load_url(Some(&cs(&url)));
+                }
+            });
+        }
+    }
+
+    /// Puts text into the panel's chat box. It never presses Enter: the user reviews and sends it.
+    fn ai_insert(&self, text: &str) {
+        let js = format!(
+            "(t=>{{const sel=['#prompt-textarea','textarea','div[contenteditable=\"true\"]','[role=\"textbox\"]'];let el=null;for(const s of sel){{el=document.querySelector(s);if(el)break}}\
+             if(!el)return;el.focus();\
+             if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'){{const d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value');d.set.call(el,t);el.dispatchEvent(new Event('input',{{bubbles:true}}))}}\
+             else{{document.execCommand('selectAll',false);document.execCommand('insertText',false,t)}}}})({})",
+            Value::String(text.to_string())
+        );
+        BROWSERS.with(|m| {
+            if let Some(f) = m.borrow().get(&AI_ID).and_then(|b| b.main_frame()) {
+                f.execute_java_script(Some(&cs(&js)), Some(&cs("imc://ai")), 0);
+            }
+        });
     }
 
     fn activate(&mut self, id: usize) {
@@ -1286,6 +1356,7 @@ impl Shell {
             "bookmark" => json!({"cmd": "bookmark"}),
             "mute_tab" => json!({"cmd": "mute", "id": self.active}),
             "fullscreen" => json!({"cmd": "fullscreen"}),
+            "ai_toggle" => json!({"cmd": "ai_toggle"}),
             "print" => json!({"cmd": "print"}),
             "focus_url" => json!({"cmd": "focus_url"}),
             "scroll_top" => json!({"cmd": "scroll_top"}),
@@ -1326,6 +1397,8 @@ impl Shell {
             "cfg": self.cfg,
             "extensions": [],
             "maximized": self.window.is_maximized(),
+            "ai": {"open": self.ai_open && self.cfg.ai.enabled, "enabled": self.cfg.ai.enabled, "site": self.cfg.ai.site, "custom": self.cfg.ai.custom, "width": self.cfg.ai.width_clamped()},
+            "ai_sites": config::AI_SITES.iter().map(|(id, n, _)| json!({"id": id, "name": n})).collect::<Vec<_>>(),
             "gesture_actions": config::GESTURE_ACTIONS.iter().map(|(id, l)| json!({"id": id, "label": l})).collect::<Vec<_>>(),
         });
         self.eval_ui(&format!("window.ui&&window.ui.set({state})"));
@@ -1506,6 +1579,83 @@ impl Shell {
             "selftest_eval" if std::env::var_os("IMC_SELFTEST").is_some() => self.eval_page(m["js"].as_str().unwrap_or("")),
             "site_info" => self.site_info(),
             "site_clear" => self.site_clear(m["kind"].as_str().unwrap_or("")),
+            "selftest_ai_read" if std::env::var_os("IMC_SELFTEST").is_some() => {
+                BROWSERS.with(|m| {
+                    if let Some(f) = m.borrow().get(&AI_ID).and_then(|b| b.main_frame()) {
+                        f.execute_java_script(Some(&cs("console.debug('SELFTEST_AI:'+((document.querySelector('textarea')||{}).value||'(nothing)').slice(0,90))")), Some(&cs("imc://selftest")), 0);
+                    }
+                });
+            }
+            "ai_toggle" => {
+                if self.cfg.ai.enabled {
+                    self.ai_open = !self.ai_open;
+                    if self.ai_open {
+                        self.ensure_ai();
+                    }
+                    self.layout();
+                    self.push();
+                }
+            }
+            "ai_close" => {
+                self.ai_open = false;
+                self.layout();
+                self.push();
+            }
+            "ai_reload" => {
+                BROWSERS.with(|m| {
+                    if let Some(b) = m.borrow().get(&AI_ID) {
+                        b.reload();
+                    }
+                });
+            }
+            "ai_settings" => {
+                let site = m["site"].as_str().unwrap_or("claude");
+                let known = site == "custom" || config::AI_SITES.iter().any(|(id, _, _)| *id == site);
+                let changed = (site != self.cfg.ai.site) || m["custom"].as_str().unwrap_or("").trim() != self.cfg.ai.custom;
+                self.cfg.ai.enabled = m["enabled"].as_bool().unwrap_or(true);
+                if known {
+                    self.cfg.ai.site = site.to_string();
+                }
+                self.cfg.ai.custom = m["custom"].as_str().unwrap_or("").trim().chars().take(400).collect();
+                self.cfg.save();
+                if self.cfg.ai.site == "custom" && self.cfg.ai.url().is_none() && !self.cfg.ai.custom.is_empty() {
+                    self.toast("That address is not valid. It must start with https://");
+                }
+                if !self.cfg.ai.enabled {
+                    self.ai_open = false;
+                } else if changed && self.ai_open {
+                    self.ai_navigate();
+                } else if changed {
+                    // forget the old site's page; the new one loads when the panel is next opened
+                    BROWSERS.with(|b| {
+                        if let Some(br) = b.borrow_mut().remove(&AI_ID) {
+                            if let Some(h) = br.host() {
+                                h.close_browser(1);
+                            }
+                        }
+                    });
+                }
+                self.layout();
+                self.push();
+            }
+            "ai_width" => {
+                self.cfg.ai.width = m["w"].as_u64().unwrap_or(420).clamp(280, 900) as u32;
+                if m["final"].as_bool().unwrap_or(false) {
+                    self.cfg.save();
+                }
+                self.layout();
+                self.push();
+            }
+            "ai_send" => {
+                let private = self.tabs.iter().any(|t| t.id == self.active && t.private);
+                if private {
+                    self.toast("Ghost tab content is never sent to an AI site.");
+                } else if self.cfg.ai.url().is_none() {
+                    self.toast("Choose an AI site in Settings, AI assistant first.");
+                } else {
+                    self.eval_page("window.__imcPageText&&window.__imcPageText()");
+                }
+            }
             "dl_list" => self.push_downloads(true),
             "dl_open" | "dl_show" | "dl_cancel" | "dl_remove" => {
                 let id = m["id"].as_u64().unwrap_or(0);
@@ -1619,6 +1769,7 @@ impl Shell {
                     c.hardware_acceleration = self.cfg.hardware_acceleration;
                     c.update = self.cfg.update.clone();
                     c.doh = self.cfg.doh.clone();
+                    c.ai = self.cfg.ai.clone();
                     c.theme = self.cfg.theme.clone();
                     c.vertical_tabs = self.cfg.vertical_tabs;
                     c.save();
@@ -1839,6 +1990,8 @@ fn main() {
         closed: vec![],
         upd: updater::Ctl::new(),
         internal,
+        ai_open: false,
+        ai_pending: None,
         dl_ids: Arc::new(AtomicU64::new(downloads.iter().map(|d| d.id).max().unwrap_or(0) + 1)),
         downloads,
         last_dl_push: Instant::now(),
@@ -1902,6 +2055,20 @@ fn main() {
             }
         });
     }
+    if std::env::var_os("IMC_SELFTEST_AI").is_some() {
+        let t = tx.clone();
+        std::thread::spawn(move || {
+            let send = |ms: u64, v: Value| {
+                std::thread::sleep(Duration::from_millis(ms));
+                let _ = t.send_event(Ev::Ipc(v.to_string()));
+            };
+            send(6000, json!({"cmd": "ai_toggle"}));
+            send(9000, json!({"cmd": "ai_send"}));
+            // read the chat box back out of the panel
+            std::thread::sleep(Duration::from_millis(7000));
+            let _ = t.send_event(Ev::Ipc(json!({"cmd": "selftest_ai_read"}).to_string()));
+        });
+    }
     if let Ok(what) = std::env::var("IMC_SELFTEST_CARD") {
         let t = tx.clone();
         std::thread::spawn(move || {
@@ -1952,6 +2119,13 @@ fn main() {
                     }
                     state.push();
                 }
+                Ev::Load(AI_ID, false) => {
+                    if let Some(msg) = state.ai_pending.take() {
+                        state.ai_insert(&msg);
+                        state.toast("Added to the AI chat box. Review it and press Enter to send.");
+                    }
+                }
+                Ev::Load(AI_ID, _) => {}
                 Ev::Load(id, loading) => {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id) {
                         t.loading = loading;
@@ -1973,6 +2147,21 @@ fn main() {
                 Ev::Zoom(d) => state.zoom_cmd(&d),
                 Ev::Update(m) => state.on_update(m),
                 Ev::Download(e) => state.on_download(e),
+                Ev::PageText { title, url, text, selected } => {
+                    let head = if selected { format!("I selected this text on the page \"{title}\" ({url}):") } else { format!("Here is the page \"{title}\" ({url}):") };
+                    let msg = format!("{head}\n\n{text}\n\n");
+                    let fresh = !BROWSERS.with(|m| m.borrow().contains_key(&AI_ID));
+                    state.ai_open = true;
+                    state.ensure_ai();
+                    state.layout();
+                    state.push();
+                    if fresh {
+                        state.ai_pending = Some(msg); // inserted when the panel's page has loaded
+                    } else {
+                        state.ai_insert(&msg);
+                        state.toast("Added to the AI chat box. Review it and press Enter to send.");
+                    }
+                }
                 Ev::FaviconUrl(id, url) => state.fetch_favicon(id, url),
                 Ev::Favicon(id, url, data) => {
                     if let Some(t) = state.tabs.iter_mut().find(|t| t.id == id && t.fav_url == url) {

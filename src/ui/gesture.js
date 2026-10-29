@@ -147,3 +147,11 @@
   });
   addEventListener('load', find);
 })();
+
+// "Send page to the AI assistant": the host asks for this and gets the selection (or the visible page
+// text), capped in size. Nothing is read or sent unless the user clicked the button.
+window.__imcPageText = () => {
+  const sel = String(getSelection() || '').trim();
+  const text = (sel || (document.body && document.body.innerText) || '').slice(0, 30000);
+  console.debug('IMCTXT:' + JSON.stringify({ selected: !!sel, title: document.title, url: location.href, text }));
+};

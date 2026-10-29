@@ -22,6 +22,7 @@ pub struct Config {
     /// Remembered zoom factor per site (host), like Chrome. Ghost tabs never write here.
     pub zoom: HashMap<String, f64>,
     pub update: UpdateCfg,
+    pub ai: Ai,
     pub doh: Doh,
     pub theme: Theme,
     pub vpn: Vpn,
@@ -40,7 +41,50 @@ pub struct Toolbar {
 impl Default for Toolbar {
     fn default() -> Self {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect();
-        Self { left: v(&["back", "forward", "reload"]), right: v(&["engine", "bookmark", "shield", "vpn", "downloads"]) }
+        Self { left: v(&["back", "forward", "reload"]), right: v(&["engine", "bookmark", "shield", "vpn", "ai", "downloads"]) }
+    }
+}
+
+/// AI assistant: a side panel that opens the AI website you choose, in this browser's own session, so
+/// your existing login is used (no API keys). Nothing from the page is sent unless you click "Send page".
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct Ai {
+    pub enabled: bool,
+    /// One of AI_SITES, or "custom".
+    pub site: String,
+    pub custom: String,
+    /// Panel width in logical pixels.
+    pub width: u32,
+}
+
+impl Default for Ai {
+    fn default() -> Self {
+        Self { enabled: true, site: "claude".into(), custom: String::new(), width: 420 }
+    }
+}
+
+pub const AI_SITES: &[(&str, &str, &str)] = &[
+    ("claude", "Claude", "https://claude.ai/new"),
+    ("chatgpt", "ChatGPT", "https://chatgpt.com/"),
+    ("gemini", "Gemini", "https://gemini.google.com/app"),
+    ("copilot", "Microsoft Copilot", "https://copilot.microsoft.com/"),
+    ("perplexity", "Perplexity", "https://www.perplexity.ai/"),
+];
+
+impl Ai {
+    /// The page to open in the panel (a custom address must be a plain https URL).
+    pub fn url(&self) -> Option<String> {
+        if self.site == "custom" {
+            let c = self.custom.trim();
+            let ok = c.starts_with("https://") && c.len() > 12 && c.len() < 400 && !c.chars().any(|ch| ch.is_whitespace() || ch.is_control() || ch == '"');
+            return ok.then(|| c.to_string());
+        }
+        AI_SITES.iter().find(|(id, _, _)| *id == self.site).map(|(_, _, u)| u.to_string())
+    }
+
+    pub fn width_clamped(&self) -> u32 {
+        self.width.clamp(280, 900)
     }
 }
 
@@ -144,6 +188,7 @@ pub const GESTURE_ACTIONS: &[(&str, &str)] = &[
     ("bookmark", "Bookmark page"),
     ("mute_tab", "Mute / unmute tab"),
     ("fullscreen", "Full screen"),
+    ("ai_toggle", "Show or hide the AI assistant"),
     ("print", "Print"),
     ("focus_url", "Focus address bar"),
     ("scroll_top", "Scroll to top"),
@@ -260,6 +305,7 @@ impl Default for Config {
             gestures: Gestures::default(),
             zoom: HashMap::new(),
             update: UpdateCfg::default(),
+            ai: Ai::default(),
             doh: Doh::default(),
             theme: Theme::default(),
             vpn: Vpn::default(),

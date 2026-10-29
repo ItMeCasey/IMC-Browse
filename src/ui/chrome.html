@@ -90,6 +90,15 @@ body.vert #engmenu{top:calc(var(--title-h) + var(--bar-h) - 6px)}
 #engmenu button{display:flex;align-items:center;gap:10px;width:100%;border:0;background:none;padding:7px 8px;border-radius:7px;cursor:pointer;text-align:left}
 #engmenu button:hover{background:var(--tab)}
 #engmenu .ck{margin-left:auto;color:var(--acc)}
+#aibtn.on{color:var(--acc);background:color-mix(in srgb,var(--acc),transparent 85%)}
+#aihead{position:absolute;right:0;top:calc(var(--title-h) + var(--tabs-h) + var(--bar-h));width:var(--ai-w,420px);height:40px;display:none;align-items:center;gap:6px;padding:0 8px;background:var(--bar);border-bottom:1px solid var(--line);border-left:1px solid var(--line);z-index:4}
+body.vert #aihead{top:calc(var(--title-h) + var(--bar-h))}
+body.ai #aihead{display:flex}
+#aihead select{flex:1;min-width:0;padding:4px 8px}
+#aidiv{position:absolute;right:calc(var(--ai-w,420px));top:calc(var(--title-h) + var(--tabs-h) + var(--bar-h));bottom:0;width:6px;cursor:col-resize;display:none;z-index:4;background:linear-gradient(90deg,transparent 2px,var(--line) 2px 4px,transparent 4px)}
+body.vert #aidiv{top:calc(var(--title-h) + var(--bar-h))}
+body.ai #aidiv{display:block}
+#aidiv:hover,#aidiv.drag{background:linear-gradient(90deg,transparent 1px,var(--acc) 1px 5px,transparent 5px)}
 #dlbtn{position:relative}
 #dlbtn .ring{position:absolute;inset:2px;border-radius:50%;display:none;background:conic-gradient(var(--acc) calc(var(--p,0) * 1%),color-mix(in srgb,var(--fg),transparent 82%) 0);-webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 3px));mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 3px))}
 #dlbtn.busy .ring{display:block}#dlbtn.busy svg{transform:scale(.62);color:var(--acc)}
@@ -206,6 +215,7 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
   <button class="btn" id="reopen" title="Reopen closed tab (Ctrl+Shift+T)"></button>
   <button class="btn" id="print" title="Print this page"></button>
   <button class="btn" id="full" title="Full screen (F11)"></button>
+  <button class="btn" id="aibtn" title="AI assistant (Ctrl+Shift+A)"></button>
   <button class="btn" id="dlbtn" title="Downloads"></button>
   <button class="btn" id="zout" title="Zoom out (Ctrl+minus)"></button>
   <button class="btn" id="zin" title="Zoom in (Ctrl+plus)"></button>
@@ -220,6 +230,7 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
     <button data-s="cards">Payment cards</button>
     <button data-s="privacy">Privacy &amp; proxy</button>
     <button data-s="toolbar">Toolbar</button>
+    <button data-s="ai">AI assistant</button>
     <button data-s="updates">Updates</button>
     <button data-s="gestures">Mouse gestures</button>
     <button class="close" id="close">Close</button>
@@ -243,6 +254,14 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
         <div class="tbcol"><h3>Available (not shown)</h3><div class="tblist" data-z="off"></div></div>
       </div>
       <p><button class="sec" id="tb_reset">Reset to default</button></p>
+    </section>
+
+    <section id="s-ai">
+      <h2>AI assistant</h2>
+      <label class="row">Enable the AI side panel<span class="switch"><input type="checkbox" id="ai_on"><i></i></span></label>
+      <label class="row">AI site<select id="ai_site2"></select></label>
+      <label class="row" id="ai_custom_row">Address (must start with https://)<input type="text" id="ai_custom" placeholder="https://example.com/chat"></label>
+      <p class="note">The panel opens the site you choose inside this browser, so it uses your normal login for that site: no API keys. Click the AI button in the toolbar (or Ctrl+Shift+A) to open it, and "Send page" to put the page text or your selection into its chat box. Nothing is sent until you click that button, and you press Enter yourself. Ghost tab pages are never sent. Some sites block or limit sign-in with Google or similar inside embedded browsers; if that happens, sign in with email on that site.</p>
     </section>
 
     <section id="s-updates">
@@ -346,6 +365,8 @@ input[type=color]{width:46px;height:28px;border:1px solid var(--line);border-rad
 </div>
 <div id="engmenu"></div>
 <div id="siteinfo"></div>
+<div id="aidiv" title="Drag to resize"></div>
+<div id="aihead"><select id="ai_site" title="AI site"></select><button class="btn" id="ai_send" title="Send this page (or your selection) to the chat box"></button><button class="btn" id="ai_rel" title="Reload"></button><button class="btn" id="ai_close" title="Close the AI panel"></button></div>
 <div id="dlpop"></div>
 <div id="toast"></div>
 
@@ -431,14 +452,14 @@ function drawDownloads(open){
 }
 
 // ---- customizable toolbar ----------------------------------------------------------------
-const TB_DEFAULT={left:['back','forward','reload'],right:['engine','bookmark','shield','vpn','downloads']};
+const TB_DEFAULT={left:['back','forward','reload'],right:['engine','bookmark','shield','vpn','ai','downloads']};
 const TB_DEFS=[
  {id:'back',el:'back',g:'back',n:'Back'},{id:'forward',el:'fwd',g:'forward',n:'Forward'},{id:'reload',el:'rel',g:'reload',n:'Reload / Stop'},
  {id:'home',el:'home',g:'home',n:'Home'},{id:'engine',el:'eng',g:'engine',n:'Search engine'},{id:'bookmark',el:'star',g:'bookmarks',n:'Bookmark this page'},
  {id:'shield',el:'shield',g:'shield-ok',n:'Blocker counter'},{id:'vpn',el:'vpn',g:'globe',n:'Proxy / VPN'},
  {id:'ghost',el:'tbghost',g:'ghost',n:'New Ghost tab'},{id:'newtab',el:'tbnew',g:'plus',n:'New tab'},
  {id:'reopen',el:'reopen',g:'undo',n:'Reopen closed tab'},{id:'print',el:'print',g:'print',n:'Print'},{id:'fullscreen',el:'full',g:'fullscreen',n:'Full screen'},
- {id:'downloads',el:'dlbtn',g:'download',n:'Downloads'},{id:'zoomout',el:'zout',g:'zoom-out',n:'Zoom out'},{id:'zoomin',el:'zin',g:'zoom-in',n:'Zoom in'}];
+ {id:'ai',el:'aibtn',g:'ai',n:'AI assistant'},{id:'downloads',el:'dlbtn',g:'download',n:'Downloads'},{id:'zoomout',el:'zout',g:'zoom-out',n:'Zoom out'},{id:'zoomin',el:'zin',g:'zoom-in',n:'Zoom in'}];
 const extEls={};
 function tbInfo(id){
   const d=TB_DEFS.find(x=>x.id===id);if(d)return d;
@@ -706,6 +727,12 @@ window.ui={
   const a=s.tabs.find(t=>t.id===s.active);
   document.body.classList.toggle('ghost',!!(a&&a.private));
   renderToolbar();
+  if(s.ai){
+    document.body.classList.toggle('ai',!!s.ai.open);document.documentElement.style.setProperty('--ai-w',s.ai.width+'px');
+    $('aibtn').classList.toggle('on',!!s.ai.open);$('aibtn').innerHTML=gl(s.ai.enabled?'ai':'ai-off',18);
+    const sel=$('ai_site');if(sel.dataset.site!==s.ai.site||!sel.options.length){sel.textContent='';for(const x of [...s.ai_sites,{id:'custom',name:'Custom address'}]){const o=document.createElement('option');o.value=x.id;o.textContent=x.name;if(x.id===s.ai.site)o.selected=true;sel.append(o)}sel.dataset.site=s.ai.site}
+    if(!window._aiInit){window._aiInit=1;$('ai_on').checked=s.ai.enabled;$('ai_custom').value=s.ai.custom;const s2=$('ai_site2');for(const x of [...s.ai_sites,{id:'custom',name:'Custom address'}]){const o=document.createElement('option');o.value=x.id;o.textContent=x.name;if(x.id===s.ai.site)o.selected=true;s2.append(o)}$('ai_custom_row').style.display=s.ai.site==='custom'?'':'none'}
+  }
   $('rel').innerHTML=gl(a&&a.loading?'stop':'reload',18);$('rel').title=a&&a.loading?'Stop loading':'Reload';$('rel').dataset.loading=a&&a.loading?'1':'';
   {const lg=$('logo');const hasLogo=a&&/^(https?|imc):/.test(a.url||'');$('urlbox').classList.toggle('hasLogo',!!hasLogo);lg.innerHTML=hasLogo?siteIcon(Object.assign({},a,{loading:false}),16):'';}
   const u=(a&&a.url)||'';$('lock').innerHTML=u.startsWith('https://')||u.startsWith('imc://')?gl('lock',14):u.startsWith('http://')?gl('unlock',14):'';
@@ -812,7 +839,7 @@ function section(n){
   if(n==='gestures')drawGestures();
   if(n==='updates')send({cmd:'update_state'});
 }
-const NAVG={updates:'reload',general:'sliders',theme:'theme',bookmarks:'bookmarks',passwords:'key',cards:'lock',privacy:'shield',toolbar:'more',gestures:'grip'};
+const NAVG={ai:'ai',updates:'reload',general:'sliders',theme:'theme',bookmarks:'bookmarks',passwords:'key',cards:'lock',privacy:'shield',toolbar:'more',gestures:'grip'};
 for(const b of document.querySelectorAll('#nav button[data-s]')){const t=b.textContent;b.innerHTML=gl(NAVG[b.dataset.s]||'sliders',15)+'<span>'+t+'</span>';b.classList.add('inl');b.onclick=()=>section(b.dataset.s)}
 for(const[i,n]of[['back','back'],['fwd','forward'],['rel','reload'],['menu','menu'],['home','home'],['tbnew','plus'],['reopen','undo'],['print','print'],['full','fullscreen'],['zout','zoom-out'],['zin','zoom-in']])$(i).innerHTML=gl(n,18);
 $('dlbtn').innerHTML='<span class="ring"></span>'+gl('download',18);
@@ -821,6 +848,19 @@ $('offline').innerHTML=gl('wifi-off',15);
 const net=()=>{$('offline').style.display=navigator.onLine?'none':'flex'};addEventListener('online',net);addEventListener('offline',net);net();
 $('close').classList.add('inl');$('close').innerHTML=gl('close',14)+'<span>Close</span>';
 $('wmin').innerHTML=gl('win-min',14);
+$('ai_send').innerHTML=gl('enter',17);$('ai_rel').innerHTML=gl('reload',16);$('ai_close').innerHTML=gl('close',16);
+$('aibtn').innerHTML=gl('ai',18);
+$('aibtn').onclick=()=>send({cmd:'ai_toggle'});
+$('ai_close').onclick=()=>send({cmd:'ai_close'});$('ai_rel').onclick=()=>send({cmd:'ai_reload'});$('ai_send').onclick=()=>send({cmd:'ai_send'});
+const sendAi=(site)=>send({cmd:'ai_settings',enabled:$('ai_on').checked,site,custom:$('ai_custom').value});
+$('ai_site').onchange=()=>{$('ai_site2').value=$('ai_site').value;$('ai_custom_row').style.display=$('ai_site').value==='custom'?'':'none';sendAi($('ai_site').value);if($('ai_site').value==='custom'){panel(true);section('ai')}};
+$('ai_site2').onchange=()=>{$('ai_site').value=$('ai_site2').value;$('ai_custom_row').style.display=$('ai_site2').value==='custom'?'':'none';sendAi($('ai_site2').value)};
+$('ai_on').onchange=()=>sendAi($('ai_site2').value);
+$('ai_custom').onchange=()=>sendAi($('ai_site2').value);
+{const d=$('aidiv');let drag=false;
+ d.addEventListener('mousedown',e=>{drag=true;d.classList.add('drag');e.preventDefault()});
+ addEventListener('mousemove',e=>{if(drag)send({cmd:'ai_width',w:Math.round(innerWidth-e.clientX-3),final:false})});
+ addEventListener('mouseup',e=>{if(drag){drag=false;d.classList.remove('drag');send({cmd:'ai_width',w:Math.round(innerWidth-e.clientX-3),final:true})}});}
 $('wmax').innerHTML=gl('win-max',14);
 $('wclose').innerHTML=gl('close',14);
 $('wmin').onclick=()=>send({cmd:'win_min'});$('wmax').onclick=()=>send({cmd:'win_max'});$('wclose').onclick=()=>send({cmd:'win_close'});
@@ -863,6 +903,7 @@ $('go').onclick=()=>{send({cmd:'settings',cfg:{freeze_after_secs:+$('p_freeze').
 addEventListener('keydown',e=>{if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='n'){send({cmd:'new',private:true});e.preventDefault();return}
   if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='t'){send({cmd:'reopen'});e.preventDefault();return}
   if(e.key==='F11'){send({cmd:'fullscreen'});e.preventDefault();return}
+  if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='a'){send({cmd:'ai_toggle'});e.preventDefault();return}
   if(e.ctrlKey&&!e.altKey&&(e.key==='='||e.key==='+')){send({cmd:'zoom_in'});e.preventDefault();return}
   if(e.ctrlKey&&!e.altKey&&(e.key==='-'||e.key==='_')){send({cmd:'zoom_out'});e.preventDefault();return}
   if(e.ctrlKey&&!e.altKey&&e.key==='0'){send({cmd:'zoom_reset'});e.preventDefault();return}

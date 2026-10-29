@@ -10,7 +10,15 @@ about 1.7px at 15px and 2.1px at 18px; the old pack was 2 => 1.25px), round caps
 square-ish geometry with 1-3 unit corner radii, solid dots for "ink" accents (eyes, keyholes, alerts).
 Stroke weight comes from CSS (--gw), so the whole pack can be thickened or thinned in one place.
 """
-import json, pathlib
+import json, math, pathlib
+
+def rays(n, lens, r0=2.6, c=12):
+    """n round-capped rays from the centre; lens cycles through outer radii."""
+    d = ""
+    for k in range(n):
+        a, R = math.radians(-90 + k * 360 / n), lens[k % len(lens)]
+        d += f"M{c + r0 * math.cos(a):.2f} {c + r0 * math.sin(a):.2f}L{c + R * math.cos(a):.2f} {c + R * math.sin(a):.2f}"
+    return d
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 GW = 2.75
@@ -127,6 +135,17 @@ GROUPS = [
   ("wifi-off",   p("M3.5 9.5a12.5 12.5 0 0 1 17 0M6.5 13a8 8 0 0 1 11 0M9.5 16.2a3.6 3.6 0 0 1 5 0") + dot(12, 19.5, 1.5) + p("M4.5 4.5l15 15")),
   ("page-error", '<rect x="5" y="3.5" width="14" height="17" rx="3"/>' + p("M9.5 9.5l5 5M14.5 9.5l-5 5")),
  ]),
+ ("AI assistants", [
+  ("gemini", p("M12 2c.6 6 4 9.4 10 10-6 .6-9.4 4-10 10-.6-6-4-9.4-10-10 6-.6 9.4-4 10-10z", F)),
+  ("claude", "<g stroke-width=\"2.5\">" + p(rays(12, [10, 7, 9.5, 6.5, 10, 7.5, 9, 6.5, 10, 7, 9.5, 7], 0)) + "</g>"),
+  ("grok", "<g stroke-width=\"3.4\">" + p("M17.4 6.4A7.6 7.6 0 1 0 19.6 13") + p("M8.5 15.5l11-11") + "</g>"),
+  ("chatgpt", "<g stroke-width=\"1.9\">" + "".join(f'<rect x="9.4" y="2.7" width="5.2" height="9.9" rx="2.6" transform="rotate({k*60} 12 12)"/>' for k in range(6)) + "</g>"),
+  ("perplexity", "<g stroke-width=\"2.2\">" + p("M5.5 2.8v7L12 15.5l6.5-5.7v-7L12 9zM12 9v12.7M5.5 13.5v7.3l6.5-5.5M18.5 13.5v7.3L12 15.3") + "</g>"),
+  ("chat",       p("M5.5 4.5h13a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H11l-4.5 4v-4h-1a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z")),
+  ("send",       p("M20 4 10.5 13.5M20 4l-6 16-3.5-6.5L4 10z")),
+  ("bot",        '<rect x="4.5" y="8" width="15" height="11" rx="3.5"/>' + p("M12 8V5") + dot(12, 4.2, 1.5) + dot(9, 13.5, 1.4) + dot(15, 13.5, 1.4)),
+  ("cpu",        '<rect x="7" y="7" width="10" height="10" rx="2.5"/>' + p("M10 3.5V7M14 3.5V7M10 17v3.5M14 17v3.5M3.5 10H7M3.5 14H7M17 10h3.5M17 14h3.5")),
+ ]),
  ("Status", [
   ("info",       '<circle cx="12" cy="12" r="8.5"/>' + p("M12 11v5.5") + dot(12, 7.8, 1.4)),
   ("warning",    p("M12 3.8 21 19.5H3z") + p("M12 10v3.5") + dot(12, 16.6, 1.2)),
@@ -135,6 +154,7 @@ GROUPS = [
  ]),
 ]
 
+BRAND = {"gemini": "#4285f4", "claude": "#d97757", "grok": "#ffffff", "chatgpt": "#10a37f", "perplexity": "#20b8cd"}
 ALL = [(n, b) for _, g in GROUPS for n, b in g]
 assert len({n for n, _ in ALL}) == len(ALL), "duplicate glyph name"
 
@@ -157,7 +177,7 @@ cards = ""
 for title, items in GROUPS:
     cards += f'<h2>{title}</h2><div class="grid">'
     for n, _ in items:
-        cards += (f'<div class="card{" spin" if n == "loading" else ""}"><svg class="g big"><use href="#g-{n}"/></svg>'
+        cards += (f'<div class="card{" spin" if n == "loading" else ""}"><svg class="g big" style="color:{BRAND.get(n,'')}"><use href="#g-{n}"/></svg>'
                   f'<span>{n}</span></div>')
     cards += "</div>"
 
@@ -274,6 +294,9 @@ USE = {
  "reader": "Reader mode", "screenshot": "Screenshot", "pip": "Picture-in-picture", "code": "Developer tools / view source",
  "image": "Image / save image", "ai": "AI assistant / summarize / ask", "ai-off": "AI disabled", "cookie": "Cookies", "wifi": "Online", "wifi-off": "Offline / no connection",
  "page-error": "Page failed to load",
+ "gemini": "Gemini", "claude": "Claude", "grok": "Grok",
+ "chatgpt": "ChatGPT", "perplexity": "Perplexity", "chat": "Chat / conversation",
+ "send": "Send prompt", "bot": "Generic AI agent", "cpu": "Local / on-device model",
  "info": "Information", "warning": "Warning", "ok": "Success", "error": "Error",
 }
 ALIASES = {"tab-close": "close", "settings": "sliders", "vertical-tabs": "sidebar", "downloads": "download",
@@ -288,7 +311,7 @@ for old in gd.glob("*.svg"): old.unlink()
 head = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
         f'stroke-width="{GW}" stroke-linecap="round" stroke-linejoin="round">')
 body = dict(ALL)
-index = {"viewBox": "24 24", "strokeWidth": GW, "color": "currentColor", "glyphs": {}, "aliases": ALIASES}
+index = {"viewBox": "24 24", "strokeWidth": GW, "color": "currentColor", "glyphs": {}, "aliases": ALIASES, "brandColors": BRAND}
 for n, _ in ALL:
     assert n in USE, n
     (gd / f"{n}.svg").write_text(head + body[n] + "</svg>\n", encoding="utf-8")

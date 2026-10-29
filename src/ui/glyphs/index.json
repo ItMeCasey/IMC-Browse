@@ -85,6 +85,15 @@
   "wifi": "Online",
   "wifi-off": "Offline / no connection",
   "page-error": "Page failed to load",
+  "gemini": "Gemini",
+  "claude": "Claude",
+  "grok": "Grok",
+  "chatgpt": "ChatGPT",
+  "perplexity": "Perplexity",
+  "chat": "Chat / conversation",
+  "send": "Send prompt",
+  "bot": "Generic AI agent",
+  "cpu": "Local / on-device model",
   "info": "Information",
   "warning": "Warning",
   "ok": "Success",
@@ -121,5 +130,12 @@
   "restore": "win-restore",
   "profile": "user",
   "bookmark-saved": "star-fill"
+ },
+ "brandColors": {
+  "gemini": "#4285f4",
+  "claude": "#d97757",
+  "grok": "#ffffff",
+  "chatgpt": "#10a37f",
+  "perplexity": "#20b8cd"
  }
 }
