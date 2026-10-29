@@ -10,15 +10,6 @@ updates:
       rust-minor-and-patch:
         update-types: [minor, patch]
 
-  - package-ecosystem: cargo
-    directory: /cef
-    schedule:
-      interval: daily
-    groups:
-      cef-rust-minor-and-patch:
-        update-types: [minor, patch]
-        exclude-patterns: [cef, cef-dll-sys]
-
   - package-ecosystem: github-actions
     directory: /
     schedule:

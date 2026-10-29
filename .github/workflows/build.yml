@@ -1,0 +1,142 @@
+# Builds, tests and packages IMC Browse. Called by ci.yml, nightly.yml and release.yml.
+#   channel ci      build and test only
+#   channel nightly also sign and replace the rolling "nightly" pre-release
+#   channel stable  also sign and publish a release for the tag
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        type: string
+        default: ci
+      update_deps:
+        description: Run `cargo update` first (nightly builds pick up new crates, including a new Chromium)
+        type: boolean
+        default: false
+    secrets:
+      IMC_UPDATE_KEY:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update crates
+        if: inputs.update_deps
+        run: cargo update
+
+      - name: Work out versions
+        id: v
+        shell: pwsh
+        run: |
+          $lock = Get-Content Cargo.lock -Raw
+          if ($lock -notmatch '(?m)^name = "cef"\r?\nversion = "([^"]+)"') { throw 'cef crate not found in Cargo.lock' }
+          $cef = $Matches[1]
+          "cef=$cef" >> $env:GITHUB_OUTPUT
+          "seq=$((Get-Date).ToUniversalTime().ToString('yyyyMMddHHmm'))" >> $env:GITHUB_OUTPUT
+          $ver = ((Get-Content Cargo.toml | Select-String '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value)
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          if ('${{ inputs.channel }}' -eq 'stable' -and $env:GITHUB_REF_NAME -ne "v$ver") {
+            throw "Tag $env:GITHUB_REF_NAME does not match the version in Cargo.toml ($ver)"
+          }
+
+      - name: Cache Chromium runtime
+        id: cefcache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cef
+          key: cef-${{ steps.v.outputs.cef }}
+
+      - name: Download Chromium runtime
+        if: steps.cefcache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          cargo install export-cef-dir --version "${{ steps.v.outputs.cef }}" --locked
+          export-cef-dir --force "$HOME/.local/share/cef"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: pwsh
+        env:
+          IMC_BUILD_ID: ${{ github.sha }}
+          IMC_BUILD_SEQ: ${{ steps.v.outputs.seq }}
+          IMC_CEF_RUNTIME: ${{ steps.v.outputs.cef }}
+        run: |
+          $env:CEF_PATH = "$HOME/.local/share/cef"
+          # --locked keeps ci and release builds on exactly the crates in Cargo.lock; nightly just updated them
+          $flags = '${{ inputs.update_deps }}' -eq 'true' ? @() : @('--locked')
+          cargo build --release @flags
+
+      - name: Test
+        shell: pwsh
+        run: |
+          $env:CEF_PATH = "$HOME/.local/share/cef"
+          cargo test --release
+
+      - name: Assemble the runnable folder
+        shell: pwsh
+        run: |
+          pwsh tools/stage-cef.ps1 -CefPath "$HOME/.local/share/cef" -Dll target/release/imc_browse.dll -Out dist
+
+      - name: Smoke test (the window opens and shows a page)
+        shell: pwsh
+        run: pwsh tools/smoke.ps1 -Exe dist/imc-browse.exe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Copy-Item dist/imc-browse.dll out/imc-browse.dll
+          $tag = '${{ inputs.channel }}' -eq 'stable' ? $env:GITHUB_REF_NAME : "nightly-${{ steps.v.outputs.seq }}"
+          Compress-Archive -Path dist/* -DestinationPath "out/IMC-Browse-$tag-win64.zip" -CompressionLevel Optimal
+          Get-ChildItem out | Format-Table Name, Length
+
+      - name: Sign the update manifest
+        if: inputs.channel != 'ci'
+        shell: pwsh
+        env:
+          IMC_UPDATE_KEY: ${{ secrets.IMC_UPDATE_KEY }}
+        run: |
+          if (-not $env:IMC_UPDATE_KEY) { throw 'IMC_UPDATE_KEY secret is not set' }
+          pip install --quiet cryptography
+          $dll = Get-Item out/imc-browse.dll
+          $m = [ordered]@{
+            channel     = '${{ inputs.channel }}'
+            version     = '${{ steps.v.outputs.version }}'
+            build       = '${{ github.sha }}'
+            seq         = [int64]'${{ steps.v.outputs.seq }}'
+            date        = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            cef_runtime = '${{ steps.v.outputs.cef }}'
+            assets      = @{ cef = [ordered]@{ name = 'imc-browse.dll'; sha256 = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower(); size = $dll.Length } }
+          }
+          [IO.File]::WriteAllText("$PWD/out/update.json", ($m | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
+          python tools/sign.py out/update.json out/update.json.sig
+
+      - name: Publish nightly
+        if: inputs.channel == 'nightly'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --cleanup-tag --yes 2>$null
+          gh release create nightly --prerelease --target ${{ github.sha }} --title "Nightly ${{ steps.v.outputs.seq }}" `
+            --notes "Rolling nightly build of ${{ github.sha }}. Less tested than stable releases. Chromium ${{ steps.v.outputs.cef }}." `
+            (Get-ChildItem out | ForEach-Object FullName)
+
+      - name: Publish release
+        if: inputs.channel == 'stable'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME --title "IMC Browse $env:GITHUB_REF_NAME" --generate-notes `
+            (Get-ChildItem out | ForEach-Object FullName)

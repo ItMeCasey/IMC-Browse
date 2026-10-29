@@ -1,0 +1,18 @@
+# Publishes a stable release when a version tag is pushed:  git tag v0.2.0 && git push origin v0.2.0
+# The tag must match `version` in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      channel: stable
+    secrets:
+      IMC_UPDATE_KEY: ${{ secrets.IMC_UPDATE_KEY }}

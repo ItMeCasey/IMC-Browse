@@ -1,0 +1,71 @@
+# Builds a nightly release when something changed: new commits on main, or new versions of the
+# crates we depend on (which includes a new Chromium). Skips the night when nothing did.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if nothing changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.d.outputs.changed }}
+      marker: ${{ steps.c.outputs.marker }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: What would change?
+        id: c
+        run: |
+          # the commit, plus what `cargo update` would pull in today
+          plan="$(cargo update --dry-run 2>&1 | grep -E 'Updating|Adding|Removing|->' | sort)"
+          marker="$(printf '%s\n%s' "$GITHUB_SHA" "$plan" | sha256sum | cut -c1-32)"
+          echo "marker=$marker" >> "$GITHUB_OUTPUT"
+          echo "$plan"
+      - name: Already built?
+        id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: .nightly-marker
+          key: nightly-${{ steps.c.outputs.marker }}
+          lookup-only: true
+      - name: Decide
+        run: |
+          if [ "${{ steps.seen.outputs.cache-hit }}" = "true" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Nothing changed since the last nightly."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+        id: d
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build.yml
+    with:
+      channel: nightly
+      update_deps: true
+    secrets:
+      IMC_UPDATE_KEY: ${{ secrets.IMC_UPDATE_KEY }}
+
+  remember:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.check.outputs.marker }}" > .nightly-marker
+      - uses: actions/cache/save@v4
+        with:
+          path: .nightly-marker
+          key: nightly-${{ needs.check.outputs.marker }}
